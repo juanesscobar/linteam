@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#12372a">
+  <meta name="description" content="LINTEAM, operaciones internas de Lin Group">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="styles.css">
+  <title>LINTEAM</title>
+</head>
+<body>
+  <div id="auth" class="auth-shell">
+    <section class="auth-card">
+      <div class="brand-mark">L</div>
+      <h1>LINTEAM</h1>
+      <p>El trabajo de tu organización, claro y conectado.</p>
+      <form id="login-form">
+        <label>Correo<input name="email" type="email" autocomplete="username" required></label>
+        <label>Contraseña<input name="password" type="password" autocomplete="current-password" minlength="8" required></label>
+        <label>ID de organización<input name="organization_id" autocomplete="organization" required></label>
+        <button type="submit">Ingresar</button>
+      </form>
+      <details>
+        <summary>Configurar primera organización</summary>
+        <form id="setup-form" class="secondary-form">
+          <label>Organización<input name="organization_name" required></label>
+          <label>Nombre del administrador<input name="admin_name" required></label>
+          <label>Correo<input name="admin_email" type="email" required></label>
+          <label>Contraseña<input name="password" type="password" minlength="12" required></label>
+          <label>Clave de inicialización<input name="bootstrap_token" type="password" required></label>
+          <button type="submit" class="secondary">Crear organización</button>
+        </form>
+      </details>
+      <p id="auth-error" class="error" role="alert"></p>
+    </section>
+  </div>
+
+  <div id="shell" class="shell" hidden>
+    <header>
+      <a class="brand" href="#home" aria-label="Inicio"><span class="brand-mark small">L</span>LINTEAM</a>
+      <div class="header-actions">
+        <button id="install" class="icon-button" hidden aria-label="Instalar aplicación">↓</button>
+        <button id="logout" class="avatar" aria-label="Cerrar sesión">↗</button>
+      </div>
+    </header>
+    <aside>
+      <nav aria-label="Principal">
+        <a href="#home" data-route="home">Inicio</a>
+        <a href="#my-work" data-route="my-work">Mi trabajo</a>
+        <a href="#inbox" data-route="inbox">Inbox <span id="inbox-count" class="badge"></span></a>
+        <a href="#search" data-route="search">Buscar</a>
+        <a href="#conciencia" data-route="conciencia">Ask Conciencia</a>
+        <a href="#overview" data-route="overview">Resumen</a>
+      </nav>
+    </aside>
+    <main id="content" tabindex="-1"></main>
+    <button id="global-create" class="fab" aria-label="Crear trabajo">＋</button>
+    <nav class="bottom-nav" aria-label="Móvil">
+      <a href="#home">Inicio</a><a href="#my-work">Mi trabajo</a><a href="#inbox">Inbox</a><a href="#search">Buscar</a>
+    </nav>
+  </div>
+
+  <dialog id="create-dialog">
+    <form id="create-form" method="dialog">
+      <div class="dialog-head"><h2>Crear trabajo</h2><button value="cancel" class="icon-button" aria-label="Cerrar">×</button></div>
+      <label>Título<input name="title" maxlength="200" required autofocus></label>
+      <label>Tipo<select name="type_code"><option>REQUEST</option><option>TASK</option><option>IT_REQUEST</option><option>LEGAL_REQUEST</option><option>PURCHASE_REQUEST</option><option>CUSTOM</option></select></label>
+      <label>Prioridad<select name="priority"><option>NORMAL</option><option>LOW</option><option>HIGH</option><option>CRITICAL</option></select></label>
+      <label>Descripción<textarea name="description" rows="4" maxlength="20000"></textarea></label>
+      <button type="submit">Crear</button>
+      <p id="create-error" class="error" role="alert"></p>
+    </form>
+  </dialog>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

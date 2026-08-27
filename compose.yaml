@@ -1,0 +1,44 @@
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: linteam
+      POSTGRES_USER: linteam
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local-linteam-password}
+    volumes:
+      - linteam_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U linteam -d linteam"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  app:
+    build: .
+    environment:
+      LINTEAM_ENVIRONMENT: development
+      LINTEAM_DATABASE_URL: postgresql+psycopg://linteam:${POSTGRES_PASSWORD:-local-linteam-password}@db:5432/linteam
+      LINTEAM_SECRET_KEY: ${LINTEAM_SECRET_KEY:-local-only-change-before-deploying}
+      LINTEAM_BOOTSTRAP_TOKEN: ${LINTEAM_BOOTSTRAP_TOKEN:-local-bootstrap-token}
+      LINTEAM_WEBHOOK_SECRET: ${LINTEAM_WEBHOOK_SECRET:-local-webhook-secret}
+      LINTEAM_ALLOWED_ORIGINS: '["http://localhost:8000"]'
+      LINTEAM_TRUSTED_HOSTS: '["localhost","127.0.0.1","app"]'
+      LINTEAM_FILE_STORAGE_PATH: /app/data/files
+    ports:
+      - "8000:8000"
+    volumes:
+      - linteam_files:/app/data/files
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready')"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+volumes:
+  linteam_db:
+  linteam_files:
