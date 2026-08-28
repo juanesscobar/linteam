@@ -146,6 +146,12 @@ class WorkItemView(BaseModel):
     updated_at: datetime
 
 
+class CurrentUserView(BaseModel):
+    id: UUID
+    name: str
+    email: EmailStr
+
+
 class AssigneeView(BaseModel):
     id: UUID
     name: str
@@ -316,6 +322,17 @@ def login(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> TokenResponse:
     return authenticate(payload, session, settings)
+
+
+@router.get("/auth/me", response_model=CurrentUserView)
+def current_user(
+    actor: Annotated[ActorContext, Depends(current_actor)],
+    session: Annotated[Session, Depends(get_session)],
+) -> CurrentUserView:
+    user = session.get(UserRecord, actor.user_id)
+    if user is None:
+        raise HTTPException(401, "Invalid or expired credentials")
+    return CurrentUserView(id=user.id, name=user.name, email=user.email)
 
 
 @router.post("/auth/refresh", response_model=TokenResponse)
