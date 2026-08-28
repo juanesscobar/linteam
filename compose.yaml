@@ -41,6 +41,8 @@ services:
 
   caddy:
     image: caddy:2-alpine
+    environment:
+      LINTEAM_DOMAIN: ${LINTEAM_DOMAIN:?LINTEAM_DOMAIN is required}
     ports:
       - "80:80"
       - "443:443"
