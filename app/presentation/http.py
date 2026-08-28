@@ -159,7 +159,12 @@ class AssigneeView(BaseModel):
 
 
 router = APIRouter(prefix="/api/v1")
-DEFAULT_MEMBER_PERMISSIONS = ["workitem.view", "workitem.create", "workitem.update"]
+DEFAULT_MEMBER_PERMISSIONS = [
+    "workitem.view",
+    "workitem.create",
+    "workitem.update",
+    "workitem.assign",
+]
 
 
 @router.post("/setup", response_model=OrganizationView, status_code=201)

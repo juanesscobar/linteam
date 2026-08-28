@@ -77,6 +77,10 @@ class AssignmentInput(BaseModel):
     assignee_id: UUID
 
 
+class AssigneesInput(BaseModel):
+    assignee_ids: list[UUID] = Field(default_factory=list, max_length=50)
+
+
 class StatusInput(BaseModel):
     status: WorkItemStatus
 
@@ -263,6 +267,80 @@ def assign(
     session.commit()
 
 
+@router.get("/work-items/{work_item_id}/assignees")
+def list_assignees(
+    work_item_id: UUID,
+    actor: Annotated[ActorContext, Depends(current_actor)],
+    session: Annotated[Session, Depends(get_session)],
+) -> list[dict[str, object]]:
+    actor.require("workitem.assign")
+    item = get_work_item(session, actor, work_item_id)
+    rows = session.execute(
+        select(UserRecord.id, UserRecord.name, UserRecord.email)
+        .join(AssignmentRecord, AssignmentRecord.assignee_id == UserRecord.id)
+        .where(AssignmentRecord.work_item_id == item.id)
+        .order_by(AssignmentRecord.created_at)
+    ).all()
+    return [{"id": row.id, "name": row.name, "email": row.email} for row in rows]
+
+
+@router.put("/work-items/{work_item_id}/assignees", status_code=204)
+def set_assignees(
+    work_item_id: UUID,
+    payload: AssigneesInput,
+    actor: Annotated[ActorContext, Depends(current_actor)],
+    session: Annotated[Session, Depends(get_session)],
+) -> None:
+    actor.require("workitem.assign")
+    item = get_work_item(session, actor, work_item_id)
+    assignee_ids = list(dict.fromkeys(payload.assignee_ids))
+    if assignee_ids:
+        valid_ids = set(
+            session.scalars(
+                select(MembershipRecord.user_id).where(
+                    MembershipRecord.organization_id == actor.organization_id,
+                    MembershipRecord.user_id.in_(assignee_ids),
+                )
+            ).all()
+        )
+        if valid_ids != set(assignee_ids):
+            raise HTTPException(404, "Assignee not found")
+    existing = session.scalars(
+        select(AssignmentRecord).where(AssignmentRecord.work_item_id == item.id)
+    ).all()
+    for assignment in existing:
+        session.delete(assignment)
+    now = datetime.now(UTC)
+    item.assigned_to = assignee_ids[0] if assignee_ids else None
+    if assignee_ids and item.status == WorkItemStatus.NEW.value:
+        item.status = WorkItemStatus.ASSIGNED.value
+    if not assignee_ids and item.status == WorkItemStatus.ASSIGNED.value:
+        item.status = WorkItemStatus.NEW.value
+    item.updated_at = now
+    session.add_all(
+        [
+            AssignmentRecord(
+                id=uuid4(), organization_id=actor.organization_id, work_item_id=item.id,
+                assignee_id=assignee_id, assigned_by=actor.user_id, accepted_at=None, created_at=now,
+            )
+            for assignee_id in assignee_ids
+        ]
+    )
+    session.add_all(
+        [
+            NotificationRecord(
+                id=uuid4(), organization_id=actor.organization_id, recipient_id=assignee_id,
+                kind="ASSIGNMENT", title=f"Asignación {item.human_readable_id}", body=item.title,
+                entity_type="work_item", entity_id=item.id, read_at=None, created_at=now,
+            )
+            for assignee_id in assignee_ids
+        ]
+    )
+    add_activity(session, actor, item, "WorkItemAssigneesUpdated", "Responsables actualizados", {"assignee_ids": [str(value) for value in assignee_ids]})
+    record_audit(session, organization_id=actor.organization_id, actor_id=actor.user_id, action="workitem.assign", entity_type="work_item", entity_id=item.id, new_state={"assignee_ids": [str(value) for value in assignee_ids]})
+    session.commit()
+
+
 @router.post("/work-items/{work_item_id}/status", status_code=204)
 def change_status(
     work_item_id: UUID,
@@ -273,7 +351,7 @@ def change_status(
     actor.require("workitem.update")
     item = get_work_item(session, actor, work_item_id)
     current = WorkItemStatus(item.status)
-    can_manage_pipeline = "*" in actor.permissions or "workitem.assign" in actor.permissions
+    can_manage_pipeline = "*" in actor.permissions or "workitem.manage" in actor.permissions
     if not can_manage_pipeline and payload.status not in ALLOWED_TRANSITIONS[current]:
         raise HTTPException(409, f"Transition {current} -> {payload.status} is not allowed")
     if (
