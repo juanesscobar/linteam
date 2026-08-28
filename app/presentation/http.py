@@ -640,3 +640,33 @@ def list_work_items(
     session: Annotated[Session, Depends(get_session)],
 ) -> object:
     return ListWorkItems(SqlWorkItemRepository(session)).execute(actor)
+
+
+@router.delete("/work-items/{work_item_id}", status_code=204)
+def archive_work_item(
+    work_item_id: UUID,
+    actor: Annotated[ActorContext, Depends(current_actor)],
+    session: Annotated[Session, Depends(get_session)],
+) -> None:
+    """Remove a work item from active views while retaining the audit trail."""
+    actor.require("workitem.delete")
+    item = session.scalar(
+        select(WorkItemRecord).where(
+            WorkItemRecord.id == work_item_id,
+            WorkItemRecord.organization_id == actor.organization_id,
+        )
+    )
+    if item is None:
+        raise HTTPException(404, "Work item not found")
+    item.status = WorkItemStatus.ARCHIVED.value
+    item.updated_at = datetime.now(UTC)
+    record_audit(
+        session,
+        organization_id=actor.organization_id,
+        actor_id=actor.user_id,
+        action="workitem.archive",
+        entity_type="work_item",
+        entity_id=item.id,
+        new_state={"status": item.status},
+    )
+    session.commit()

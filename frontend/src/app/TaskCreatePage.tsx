@@ -22,7 +22,7 @@ export function TaskCreatePage() {
     try {
       await api("/work-items", {
         method: "POST",
-        body: { ...values, due_at: values.due_at || null },
+        body: { ...values, due_at: values.due_at ? new Date(values.due_at).toISOString() : null },
       });
       window.location.assign("/app/my-work");
     } catch (reason) {
