@@ -20,7 +20,8 @@ function CreateRedirect() {
   useEffect(() => {
     const redirect = (event: MouseEvent) => {
       const button = (event.target as Element | null)?.closest("button");
-      if (button?.textContent?.trim().startsWith("Crear") && !button.closest('[role="dialog"]')) {
+      const isWorkCreationButton = button?.classList.contains("compact") || Boolean(button?.closest(".bottom-nav"));
+      if (isWorkCreationButton && button?.textContent?.trim().startsWith("Crear") && !button.closest('[role="dialog"]')) {
         event.preventDefault();
         event.stopPropagation();
         window.location.assign("/app/create");
