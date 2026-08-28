@@ -17,16 +17,16 @@ services:
   app:
     build: .
     environment:
-      LINTEAM_ENVIRONMENT: development
-      LINTEAM_DATABASE_URL: postgresql+psycopg://linteam:${POSTGRES_PASSWORD:-local-linteam-password}@db:5432/linteam
-      LINTEAM_SECRET_KEY: ${LINTEAM_SECRET_KEY:-local-only-change-before-deploying}
-      LINTEAM_BOOTSTRAP_TOKEN: ${LINTEAM_BOOTSTRAP_TOKEN:-local-bootstrap-token}
-      LINTEAM_WEBHOOK_SECRET: ${LINTEAM_WEBHOOK_SECRET:-local-webhook-secret}
-      LINTEAM_ALLOWED_ORIGINS: '["http://localhost:8000"]'
-      LINTEAM_TRUSTED_HOSTS: '["localhost","127.0.0.1","app"]'
+      LINTEAM_ENVIRONMENT: ${LINTEAM_ENVIRONMENT:-production}
+      LINTEAM_DATABASE_URL: postgresql+psycopg://linteam:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@db:5432/linteam
+      LINTEAM_SECRET_KEY: ${LINTEAM_SECRET_KEY:?LINTEAM_SECRET_KEY is required}
+      LINTEAM_BOOTSTRAP_TOKEN: ${LINTEAM_BOOTSTRAP_TOKEN:?LINTEAM_BOOTSTRAP_TOKEN is required}
+      LINTEAM_WEBHOOK_SECRET: ${LINTEAM_WEBHOOK_SECRET:?LINTEAM_WEBHOOK_SECRET is required}
+      LINTEAM_ALLOWED_ORIGINS: '["https://${LINTEAM_DOMAIN:?LINTEAM_DOMAIN is required}"]'
+      LINTEAM_TRUSTED_HOSTS: '["${LINTEAM_DOMAIN}","app","localhost","127.0.0.1"]'
       LINTEAM_FILE_STORAGE_PATH: /app/data/files
-    ports:
-      - "8000:8000"
+    expose:
+      - "8000"
     volumes:
       - linteam_files:/app/data/files
     depends_on:
@@ -39,6 +39,22 @@ services:
       retries: 12
     restart: unless-stopped
 
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      app:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   linteam_db:
   linteam_files:
+  caddy_data:
+  caddy_config:

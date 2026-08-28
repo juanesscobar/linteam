@@ -1,0 +1,8 @@
+{
+    email {$LINTEAM_ACME_EMAIL}
+}
+
+{$LINTEAM_DOMAIN} {
+    encode zstd gzip
+    reverse_proxy app:8000
+}
