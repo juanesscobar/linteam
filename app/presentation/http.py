@@ -642,6 +642,23 @@ def list_work_items(
     return ListWorkItems(SqlWorkItemRepository(session)).execute(actor)
 
 
+@router.get("/work-items/{work_item_id}", response_model=WorkItemView)
+def get_work_item(
+    work_item_id: UUID,
+    actor: Annotated[ActorContext, Depends(current_actor)],
+    session: Annotated[Session, Depends(get_session)],
+) -> WorkItemRecord:
+    item = session.scalar(
+        select(WorkItemRecord).where(
+            WorkItemRecord.id == work_item_id,
+            WorkItemRecord.organization_id == actor.organization_id,
+        )
+    )
+    if item is None:
+        raise HTTPException(404, "Work item not found")
+    return item
+
+
 @router.delete("/work-items/{work_item_id}", status_code=204)
 def archive_work_item(
     work_item_id: UUID,

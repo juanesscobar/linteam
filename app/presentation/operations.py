@@ -273,9 +273,14 @@ def change_status(
     actor.require("workitem.update")
     item = get_work_item(session, actor, work_item_id)
     current = WorkItemStatus(item.status)
-    if payload.status not in ALLOWED_TRANSITIONS[current]:
+    can_manage_pipeline = "*" in actor.permissions or "workitem.assign" in actor.permissions
+    if not can_manage_pipeline and payload.status not in ALLOWED_TRANSITIONS[current]:
         raise HTTPException(409, f"Transition {current} -> {payload.status} is not allowed")
-    if payload.status == WorkItemStatus.ACCEPTED and item.assigned_to != actor.user_id:
+    if (
+        payload.status == WorkItemStatus.ACCEPTED
+        and not can_manage_pipeline
+        and item.assigned_to != actor.user_id
+    ):
         raise HTTPException(403, "Only the assignee can accept this work")
     item.status = payload.status.value
     item.updated_at = datetime.now(UTC)

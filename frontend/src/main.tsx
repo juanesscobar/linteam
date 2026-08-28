@@ -7,6 +7,7 @@ import { JoinPage } from "./app/JoinPage";
 import { InvitePage } from "./app/InvitePage";
 import { TaskCreatePage } from "./app/TaskCreatePage";
 import { TaskManagePage } from "./app/TaskManagePage";
+import { TicketDetailDialog } from "./app/TicketDetailDialog";
 import "./styles.css";
 
 const client = new QueryClient({ defaultOptions: { queries: { retry: 1, staleTime: 20_000 } } });
@@ -30,7 +31,16 @@ function CreateRedirect() {
   }, []);
   return null;
 }
+function TicketDialogBridge() {
+  const [ticketId, setTicketId] = React.useState<string | null>(null);
+  useEffect(() => {
+    const open = (event: Event) => setTicketId((event as CustomEvent<string>).detail);
+    window.addEventListener("linteam:open-ticket", open);
+    return () => window.removeEventListener("linteam:open-ticket", open);
+  }, []);
+  return ticketId ? <TicketDetailDialog id={ticketId} onClose={() => setTicketId(null)} /> : null;
+}
 
 const pathname = window.location.pathname;
-const page = pathname === "/join" ? <JoinPage /> : pathname === "/invite" ? <InvitePage /> : pathname === "/app/create" ? <TaskCreatePage /> : pathname === "/app/work" ? <TaskManagePage /> : <><CreateRedirect /><App /></>;
+const page = pathname === "/join" ? <JoinPage /> : pathname === "/invite" ? <InvitePage /> : pathname === "/app/create" ? <TaskCreatePage /> : pathname === "/app/work" ? <TaskManagePage /> : <><CreateRedirect /><App /><TicketDialogBridge /></>;
 createRoot(document.getElementById("root")!).render(<React.StrictMode><QueryClientProvider client={client}><BrowserRouter>{page}</BrowserRouter></QueryClientProvider></React.StrictMode>);
