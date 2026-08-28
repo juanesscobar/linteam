@@ -36,6 +36,62 @@ def client(tmp_path) -> Generator[TestClient, None, None]:
     app.dependency_overrides.clear()
 
 
+def test_invited_member_can_join_and_then_log_in_without_organization_id(client: TestClient) -> None:
+    setup = client.post(
+        "/api/v1/setup",
+        headers={"X-Bootstrap-Token": "development-bootstrap-token"},
+        json={
+            "organization_name": "Lin Group",
+            "organization_code": "LINTEAM",
+            "admin_name": "Admin",
+            "admin_email": "admin@linteam.example.com",
+            "password": "very-secure-password",
+        },
+    )
+    assert setup.status_code == 201
+    assert setup.json()["code"] == "LINTEAM"
+    admin_login = client.post(
+        "/api/v1/auth/login",
+        json={"email": "admin@linteam.example.com", "password": "very-secure-password"},
+    )
+    assert admin_login.status_code == 200
+    invitation = client.post(
+        "/api/v1/invitations",
+        headers={"Authorization": f"Bearer {admin_login.json()['access_token']}"},
+        json={"email": "member@lingroup.example.com"},
+    )
+    assert invitation.status_code == 201
+    joined = client.post(
+        "/api/v1/auth/join",
+        json={
+            "organization_code": "LINTEAM",
+            "invitation_token": invitation.json()["invitation_token"],
+            "name": "Miembro Lin Group",
+            "email": "member@lingroup.example.com",
+            "password": "member-secure-password",
+        },
+    )
+    assert joined.status_code == 201
+    member_login = client.post(
+        "/api/v1/auth/login",
+        json={"email": "member@lingroup.example.com", "password": "member-secure-password"},
+    )
+    assert member_login.status_code == 200
+    assert (
+        client.post(
+            "/api/v1/auth/join",
+            json={
+                "organization_code": "LINTEAM",
+                "invitation_token": invitation.json()["invitation_token"],
+                "name": "Otra Persona",
+                "email": "member@lingroup.example.com",
+                "password": "another-secure-password",
+            },
+        ).status_code
+        == 403
+    )
+
+
 def test_authenticated_end_to_end_flow(client: TestClient) -> None:
     payload = {
         "organization_name": "Lin Group",

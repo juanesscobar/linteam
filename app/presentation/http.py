@@ -1,4 +1,7 @@
-from datetime import UTC, datetime
+import hashlib
+import hmac
+import secrets
+from datetime import UTC, datetime, timedelta
 from typing import Annotated
 from uuid import UUID, uuid4
 
@@ -9,14 +12,17 @@ from sqlalchemy.orm import Session
 
 from app.application.auth import ActorContext
 from app.application.use_cases import CreateWorkItem, ListWorkItems
-from app.domain.models import Priority
+from app.domain.models import Priority, WorkItemStatus
 from app.infrastructure.database import (
     CustomFieldDefinitionRecord,
     CustomFieldValueRecord,
+    AssignmentRecord,
     DepartmentRecord,
     ExpectedDeliverableRecord,
     MembershipRecord,
+    NotificationRecord,
     OrganizationRecord,
+    OrganizationInviteRecord,
     RoleRecord,
     TagRecord,
     TeamRecord,
@@ -38,6 +44,7 @@ from app.presentation.auth import (
     TokenResponse,
     authenticate,
     current_actor,
+    issue_token_pair,
     revoke_refresh_token,
     rotate_refresh_token,
 )
@@ -46,6 +53,7 @@ from app.settings import Settings, get_settings
 
 class BootstrapRequest(BaseModel):
     organization_name: str = Field(min_length=2, max_length=120)
+    organization_code: str = Field(default="LINTEAM", min_length=2, max_length=30)
     admin_name: str = Field(min_length=2, max_length=160)
     admin_email: EmailStr
     password: str = Field(min_length=12, max_length=128)
@@ -55,7 +63,29 @@ class OrganizationView(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: UUID
     name: str
+    code: str
     created_at: datetime
+
+
+class InvitationInput(BaseModel):
+    email: EmailStr
+    expires_in_days: int = Field(default=7, ge=1, le=30)
+
+
+class InvitationView(BaseModel):
+    id: UUID
+    email: EmailStr
+    organization_code: str
+    invitation_token: str
+    expires_at: datetime
+
+
+class JoinRequest(BaseModel):
+    organization_code: str = Field(min_length=2, max_length=30)
+    invitation_token: str = Field(min_length=20, max_length=200)
+    name: str = Field(min_length=2, max_length=160)
+    email: EmailStr
+    password: str = Field(min_length=12, max_length=128)
 
 
 class DepartmentInput(BaseModel):
@@ -95,6 +125,7 @@ class WorkItemInput(BaseModel):
     expected_deliverable: str = Field(default="", max_length=500)
     tag_ids: list[UUID] = Field(default_factory=list)
     custom_fields: dict[str, object] = Field(default_factory=dict)
+    assignee_ids: list[UUID] = Field(default_factory=list, max_length=50)
     due_at: datetime | None = None
 
 
@@ -115,7 +146,14 @@ class WorkItemView(BaseModel):
     updated_at: datetime
 
 
+class AssigneeView(BaseModel):
+    id: UUID
+    name: str
+    email: EmailStr
+
+
 router = APIRouter(prefix="/api/v1")
+DEFAULT_MEMBER_PERMISSIONS = ["workitem.view", "workitem.create", "workitem.update"]
 
 
 @router.post("/setup", response_model=OrganizationView, status_code=201)
@@ -130,7 +168,10 @@ def bootstrap(
     if session.scalar(select(func.count()).select_from(OrganizationRecord)):
         raise HTTPException(409, "System is already initialized")
     organization = OrganizationRecord(
-        id=uuid4(), name=payload.organization_name.strip(), created_at=datetime.now(UTC)
+        id=uuid4(),
+        name=payload.organization_name.strip(),
+        code=payload.organization_code.strip().upper(),
+        created_at=datetime.now(UTC),
     )
     user = UserRecord(
         id=uuid4(),
@@ -162,6 +203,110 @@ def bootstrap(
     )
     session.commit()
     return organization
+
+
+@router.post("/invitations", response_model=InvitationView, status_code=201)
+def create_invitation(
+    payload: InvitationInput,
+    actor: Annotated[ActorContext, Depends(current_actor)],
+    session: Annotated[Session, Depends(get_session)],
+) -> InvitationView:
+    actor.require("member.manage")
+    organization = session.get(OrganizationRecord, actor.organization_id)
+    if organization is None:
+        raise HTTPException(404, "Organization not found")
+    email = str(payload.email).lower()
+    if session.scalar(select(UserRecord).where(UserRecord.email == email)) is not None:
+        raise HTTPException(409, "This email already has an account")
+    raw_token = secrets.token_urlsafe(32)
+    invitation = OrganizationInviteRecord(
+        id=uuid4(),
+        organization_id=actor.organization_id,
+        email=email,
+        token_hash=hashlib.sha256(raw_token.encode()).hexdigest(),
+        created_by=actor.user_id,
+        expires_at=datetime.now(UTC) + timedelta(days=payload.expires_in_days),
+        accepted_at=None,
+        created_at=datetime.now(UTC),
+    )
+    session.add(invitation)
+    record_audit(
+        session,
+        organization_id=actor.organization_id,
+        actor_id=actor.user_id,
+        action="invitation.create",
+        entity_type="organization_invite",
+        entity_id=invitation.id,
+        new_state={"email": email, "expires_at": invitation.expires_at.isoformat()},
+    )
+    session.commit()
+    return InvitationView(
+        id=invitation.id,
+        email=email,
+        organization_code=organization.code,
+        invitation_token=raw_token,
+        expires_at=invitation.expires_at,
+    )
+
+
+@router.post("/auth/join", response_model=TokenResponse, status_code=201)
+def join_organization(
+    payload: JoinRequest,
+    session: Annotated[Session, Depends(get_session)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> TokenResponse:
+    email = str(payload.email).lower()
+    organization = session.scalar(
+        select(OrganizationRecord).where(OrganizationRecord.code == payload.organization_code.strip().upper())
+    )
+    if organization is None:
+        raise HTTPException(404, "Organization code not found")
+    token_hash = hashlib.sha256(payload.invitation_token.encode()).hexdigest()
+    invitation = session.scalar(
+        select(OrganizationInviteRecord).where(
+            OrganizationInviteRecord.organization_id == organization.id,
+            OrganizationInviteRecord.email == email,
+            OrganizationInviteRecord.token_hash == token_hash,
+        )
+    )
+    now = datetime.now(UTC)
+    invitation_expired = invitation is None or invitation.expires_at.replace(tzinfo=UTC) <= now
+    if invitation_expired or invitation.accepted_at is not None:
+        raise HTTPException(403, "Invitation is invalid, expired, or already used")
+    if not hmac.compare_digest(invitation.token_hash, token_hash):
+        raise HTTPException(403, "Invitation is invalid, expired, or already used")
+    if session.scalar(select(UserRecord).where(UserRecord.email == email)) is not None:
+        raise HTTPException(409, "This email already has an account")
+    user = UserRecord(
+        id=uuid4(),
+        email=email,
+        name=payload.name.strip(),
+        password_hash=hash_password(payload.password),
+        is_active=True,
+    )
+    session.add(user)
+    session.flush()
+    membership = MembershipRecord(
+        id=uuid4(),
+        organization_id=organization.id,
+        user_id=user.id,
+        department_id=None,
+        permissions=DEFAULT_MEMBER_PERMISSIONS,
+    )
+    session.add(membership)
+    invitation.accepted_at = now
+    record_audit(
+        session,
+        organization_id=organization.id,
+        actor_id=user.id,
+        action="member.join",
+        entity_type="membership",
+        entity_id=membership.id,
+        new_state={"email": email},
+    )
+    response, _ = issue_token_pair(user.id, organization.id, session, settings)
+    session.commit()
+    return response
 
 
 @router.post("/auth/login", response_model=TokenResponse)
@@ -397,6 +542,54 @@ def create_work_item(
             for key, value in payload.custom_fields.items()
         ]
     )
+    assignee_ids = list(dict.fromkeys(payload.assignee_ids))
+    if assignee_ids:
+        actor.require("workitem.assign")
+        valid_assignee_ids = set(
+            session.scalars(
+                select(MembershipRecord.user_id).where(
+                    MembershipRecord.organization_id == actor.organization_id,
+                    MembershipRecord.user_id.in_(assignee_ids),
+                )
+            ).all()
+        )
+        if valid_assignee_ids != set(assignee_ids):
+            raise HTTPException(404, "Assignee not found")
+        now = datetime.now(UTC)
+        record.assigned_to = assignee_ids[0]
+        record.status = WorkItemStatus.ASSIGNED.value
+        record.updated_at = now
+        session.add_all(
+            [
+                AssignmentRecord(
+                    id=uuid4(),
+                    organization_id=actor.organization_id,
+                    work_item_id=record.id,
+                    assignee_id=assignee_id,
+                    assigned_by=actor.user_id,
+                    accepted_at=None,
+                    created_at=now,
+                )
+                for assignee_id in assignee_ids
+            ]
+        )
+        session.add_all(
+            [
+                NotificationRecord(
+                    id=uuid4(),
+                    organization_id=actor.organization_id,
+                    recipient_id=assignee_id,
+                    kind="ASSIGNMENT",
+                    title=f"Asignación {record.human_readable_id}",
+                    body=record.title,
+                    entity_type="work_item",
+                    entity_id=record.id,
+                    read_at=None,
+                    created_at=now,
+                )
+                for assignee_id in assignee_ids
+            ]
+        )
     record_audit(
         session,
         organization_id=actor.organization_id,
@@ -404,7 +597,11 @@ def create_work_item(
         action="workitem.create",
         entity_type="work_item",
         entity_id=item.id,
-        new_state={"title": item.title, "status": item.status.value},
+        new_state={
+            "title": item.title,
+            "status": record.status,
+            "assignee_ids": [str(assignee_id) for assignee_id in assignee_ids],
+        },
     )
     record_event(
         session,
@@ -412,10 +609,29 @@ def create_work_item(
         aggregate_type="work_item",
         aggregate_id=item.id,
         event_type="WorkItemCreated",
-        payload={"reference": item.human_readable_id, "type": item.type_code},
+        payload={
+            "reference": item.human_readable_id,
+            "type": item.type_code,
+            "assignee_ids": [str(assignee_id) for assignee_id in assignee_ids],
+        },
     )
     session.commit()
     return item
+
+
+@router.get("/work-item-assignees", response_model=list[AssigneeView])
+def work_item_assignees(
+    actor: Annotated[ActorContext, Depends(current_actor)],
+    session: Annotated[Session, Depends(get_session)],
+) -> list[AssigneeView]:
+    actor.require("workitem.assign")
+    rows = session.execute(
+        select(UserRecord.id, UserRecord.name, UserRecord.email)
+        .join(MembershipRecord, MembershipRecord.user_id == UserRecord.id)
+        .where(MembershipRecord.organization_id == actor.organization_id, UserRecord.is_active.is_(True))
+        .order_by(UserRecord.name)
+    ).all()
+    return [AssigneeView(id=row.id, name=row.name, email=row.email) for row in rows]
 
 
 @router.get("/work-items", response_model=list[WorkItemView])

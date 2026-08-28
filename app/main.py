@@ -7,7 +7,7 @@ from typing import Any
 from uuid import uuid4
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text as sql_text
 from starlette.middleware.cors import CORSMiddleware
@@ -56,8 +56,46 @@ app.include_router(agents_router)
 app.include_router(projects_router)
 app.include_router(configuration_router)
 app.include_router(people_router)
-frontend_directory = Path(__file__).resolve().parent.parent / "frontend"
-app.mount("/app", StaticFiles(directory=frontend_directory, html=True), name="frontend")
+DIST_DIRECTORY = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+SPA_INDEX = DIST_DIRECTORY / "index.html"
+ASSETS_DIRECTORY = DIST_DIRECTORY / "assets"
+
+if not SPA_INDEX.is_file() or not ASSETS_DIRECTORY.is_dir():
+    raise RuntimeError("React frontend build is missing: expected frontend/dist")
+
+
+def frontend_file(path: str) -> Path | None:
+    """Return a real file inside the Vite build, never a path outside it."""
+    candidate = (DIST_DIRECTORY / path).resolve()
+    try:
+        candidate.relative_to(DIST_DIRECTORY.resolve())
+    except ValueError:
+        return None
+    return candidate if candidate.is_file() else None
+
+
+app.mount("/app/assets", StaticFiles(directory=ASSETS_DIRECTORY), name="frontend-assets")
+
+
+@app.get("/login", include_in_schema=False)
+@app.get("/setup", include_in_schema=False)
+@app.get("/join", include_in_schema=False)
+@app.get("/invite", include_in_schema=False)
+@app.get("/app/create", include_in_schema=False)
+@app.get("/display/operations", include_in_schema=False)
+def public_frontend() -> FileResponse:
+    return FileResponse(SPA_INDEX)
+
+
+@app.get("/app", include_in_schema=False)
+@app.get("/app/", include_in_schema=False)
+def app_index() -> FileResponse:
+    return FileResponse(SPA_INDEX)
+
+
+@app.get("/app/{route:path}", include_in_schema=False)
+def frontend_route(route: str) -> FileResponse:
+    return FileResponse(frontend_file(route) or SPA_INDEX)
 
 
 @app.middleware("http")
@@ -122,4 +160,4 @@ def ready() -> dict[str, str]:
 
 @app.get("/", include_in_schema=False)
 def root() -> RedirectResponse:
-    return RedirectResponse("/app/")
+    return RedirectResponse("/login")

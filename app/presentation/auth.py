@@ -32,7 +32,7 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str = Field(min_length=8, max_length=128)
-    organization_id: UUID
+    organization_id: UUID | None = None
 
 
 class TokenResponse(BaseModel):
@@ -86,15 +86,17 @@ def authenticate(payload: LoginRequest, session: Session, settings: Settings) ->
         or not verify_password(payload.password, user.password_hash)
     ):
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    membership = session.scalar(
-        select(MembershipRecord).where(
-            MembershipRecord.user_id == user.id,
-            MembershipRecord.organization_id == payload.organization_id,
-        )
+    memberships = list(
+        session.scalars(select(MembershipRecord).where(MembershipRecord.user_id == user.id)).all()
+    )
+    membership = (
+        next((m for m in memberships if m.organization_id == payload.organization_id), None)
+        if payload.organization_id
+        else (memberships[0] if len(memberships) == 1 else None)
     )
     if membership is None:
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    response, _ = issue_token_pair(user.id, payload.organization_id, session, settings)
+    response, _ = issue_token_pair(user.id, membership.organization_id, session, settings)
     session.commit()
     return response
 

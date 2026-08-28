@@ -9,3 +9,12 @@ data
 *.db
 tests
 docs
+.gitignore
+.dockerignore
+Dockerfile
+.vscode
+.idea
+*.log
+node_modules
+.DS_Store
+Thumbs.db

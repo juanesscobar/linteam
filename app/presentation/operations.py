@@ -20,6 +20,10 @@ from app.infrastructure.database import (
     MembershipRecord,
     NotificationRecord,
     OutboxEventRecord,
+    UserRecord,
+    WorkflowRecord,
+    WorkflowStateRecord,
+    WorkflowTransitionRecord,
     WorkItemRecord,
     WorkItemRelationRecord,
     get_session,
@@ -52,6 +56,20 @@ ALLOWED_TRANSITIONS: dict[WorkItemStatus, set[WorkItemStatus]] = {
     WorkItemStatus.COMPLETED: {WorkItemStatus.ARCHIVED},
     WorkItemStatus.CANCELLED: {WorkItemStatus.ARCHIVED},
     WorkItemStatus.ARCHIVED: set(),
+}
+
+STATE_LABELS = {
+    "NEW": "Nuevo",
+    "ASSIGNED": "Asignado",
+    "ACCEPTED": "Aceptado",
+    "IN_PROGRESS": "En progreso",
+    "WAITING": "En espera",
+    "BLOCKED": "Bloqueado",
+    "REVIEW": "En revisión",
+    "APPROVAL_REQUIRED": "Requiere aprobación",
+    "COMPLETED": "Completado",
+    "CANCELLED": "Cancelado",
+    "ARCHIVED": "Archivado",
 }
 
 
@@ -540,6 +558,12 @@ def my_work(
             WorkItemRecord.organization_id == actor.organization_id,
             or_(
                 WorkItemRecord.assigned_to == actor.user_id,
+                WorkItemRecord.id.in_(
+                    select(AssignmentRecord.work_item_id).where(
+                        AssignmentRecord.organization_id == actor.organization_id,
+                        AssignmentRecord.assignee_id == actor.user_id,
+                    )
+                ),
                 WorkItemRecord.created_by == actor.user_id,
             ),
             WorkItemRecord.status.notin_(
@@ -671,3 +695,222 @@ def publish_outbox(
             retried += 1
     session.commit()
     return {"published": published, "retried": retried}
+
+
+class PipelineStateView(BaseModel):
+    code: str
+    name: str
+    position: int
+    initial: bool
+    terminal: bool
+    count: int = 0
+
+
+class PipelineCardView(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: UUID
+    human_readable_id: str
+    title: str
+    type_code: str
+    priority: str
+    status: str
+    assigned_to: UUID | None
+    assignee_name: str | None = None
+    source_department_id: UUID | None = None
+    branch: str = ""
+    due_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
+    is_overdue: bool = False
+    is_blocked: bool = False
+
+
+class PipelineBoardView(BaseModel):
+    workflow_id: UUID | None = None
+    workflow_name: str | None = None
+    states: list[PipelineStateView]
+    cards: list[PipelineCardView]
+    members: list[dict[str, object]]
+
+
+@router.get("/pipeline/board", response_model=PipelineBoardView)
+def pipeline_board(
+    actor: Annotated[ActorContext, Depends(current_actor)],
+    session: Annotated[Session, Depends(get_session)],
+    status_filter: str | None = None,
+    priority_filter: str | None = None,
+    assignee_filter: UUID | None = None,
+    department_filter: UUID | None = None,
+    branch_filter: str | None = None,
+    overdue_only: bool = False,
+    tag_filter: str | None = None,
+) -> PipelineBoardView:
+    actor.require("workitem.view")
+    workflow = session.scalar(
+        select(WorkflowRecord).where(
+            WorkflowRecord.organization_id == actor.organization_id,
+            WorkflowRecord.active.is_(True),
+        )
+    )
+    states: list[PipelineStateView] = []
+    if workflow is not None:
+        state_records = session.scalars(
+            select(WorkflowStateRecord)
+            .where(WorkflowStateRecord.workflow_id == workflow.id)
+            .order_by(WorkflowStateRecord.position)
+        ).all()
+        states = [
+            PipelineStateView(
+                code=s.code,
+                name=STATE_LABELS.get(s.code, s.name),
+                position=s.position,
+                initial=s.initial,
+                terminal=s.terminal,
+            )
+            for s in state_records
+        ]
+    else:
+        for position, code in enumerate(
+            [
+                WorkItemStatus.NEW,
+                WorkItemStatus.ASSIGNED,
+                WorkItemStatus.ACCEPTED,
+                WorkItemStatus.IN_PROGRESS,
+                WorkItemStatus.WAITING,
+                WorkItemStatus.BLOCKED,
+                WorkItemStatus.REVIEW,
+                WorkItemStatus.APPROVAL_REQUIRED,
+                WorkItemStatus.COMPLETED,
+            ]
+        ):
+            states.append(
+                PipelineStateView(
+                    code=code.value,
+                    name=STATE_LABELS[code.value],
+                    position=position,
+                    initial=code == WorkItemStatus.NEW,
+                    terminal=code in (WorkItemStatus.COMPLETED, WorkItemStatus.CANCELLED),
+                )
+            )
+    base_filters = [
+        WorkItemRecord.organization_id == actor.organization_id,
+        WorkItemRecord.status.notin_(
+            [WorkItemStatus.ARCHIVED.value, WorkItemStatus.CANCELLED.value]
+        ),
+    ]
+    if status_filter:
+        base_filters.append(WorkItemRecord.status == status_filter)
+    if priority_filter:
+        base_filters.append(WorkItemRecord.priority == priority_filter)
+    if assignee_filter:
+        base_filters.append(WorkItemRecord.assigned_to == assignee_filter)
+    if department_filter:
+        base_filters.append(
+            or_(
+                WorkItemRecord.source_department_id == department_filter,
+                WorkItemRecord.destination_department_id == department_filter,
+            )
+        )
+    if branch_filter:
+        base_filters.append(WorkItemRecord.branch == branch_filter)
+    now = datetime.now(UTC)
+    if overdue_only:
+        base_filters.append(WorkItemRecord.due_at < now)
+        base_filters.append(
+            WorkItemRecord.status.notin_(
+                [WorkItemStatus.COMPLETED.value, WorkItemStatus.ARCHIVED.value]
+            )
+        )
+    items = session.scalars(
+        select(WorkItemRecord)
+        .where(*base_filters)
+        .order_by(
+            WorkItemRecord.due_at.asc().nullslast(),
+            WorkItemRecord.priority.desc(),
+            WorkItemRecord.created_at.desc(),
+        )
+    ).all()
+    if tag_filter:
+        items = [item for item in items if any(t.name == tag_filter for t in item.tags)]
+    state_code_set = {s.code for s in states}
+    count_by_status: dict[str, int] = {}
+    for item in items:
+        count_by_status[item.status] = count_by_status.get(item.status, 0) + 1
+    for s in states:
+        s.count = count_by_status.get(s.code, 0)
+    user_ids = {item.assigned_to for item in items if item.assigned_to}
+    user_names: dict[UUID, str] = {}
+    if user_ids:
+        users = session.scalars(select(UserRecord).where(UserRecord.id.in_(user_ids))).all()
+        user_names = {u.id: u.name for u in users}
+    cards = []
+    for item in items:
+        if item.status not in state_code_set:
+            continue
+        is_overdue = (
+            item.due_at is not None
+            and item.due_at < now
+            and item.status not in (WorkItemStatus.COMPLETED.value, WorkItemStatus.ARCHIVED.value)
+        )
+        cards.append(
+            PipelineCardView(
+                id=item.id,
+                human_readable_id=item.human_readable_id,
+                title=item.title,
+                type_code=item.type_code,
+                priority=item.priority,
+                status=item.status,
+                assigned_to=item.assigned_to,
+                assignee_name=user_names.get(item.assigned_to) if item.assigned_to else None,
+                source_department_id=item.source_department_id,
+                branch=item.branch,
+                due_at=item.due_at,
+                created_at=item.created_at,
+                updated_at=item.updated_at,
+                is_overdue=is_overdue,
+                is_blocked=item.status == WorkItemStatus.BLOCKED.value,
+            )
+        )
+    members = session.scalars(
+        select(MembershipRecord).where(
+            MembershipRecord.organization_id == actor.organization_id,
+        )
+    ).all()
+    member_list = []
+    for m in members:
+        user = session.get(UserRecord, m.user_id)
+        if user:
+            member_list.append({"id": str(m.user_id), "name": user.name})
+    return PipelineBoardView(
+        workflow_id=workflow.id if workflow else None,
+        workflow_name=workflow.name if workflow else None,
+        states=states,
+        cards=cards,
+        members=member_list,
+    )
+
+
+@router.get("/pipeline/transitions")
+def pipeline_transitions(
+    work_item_id: UUID,
+    actor: Annotated[ActorContext, Depends(current_actor)],
+    session: Annotated[Session, Depends(get_session)],
+) -> list[dict[str, str]]:
+    actor.require("workitem.view")
+    item = get_work_item(session, actor, work_item_id)
+    if item.workflow_id and item.workflow_state_id:
+        transitions = session.scalars(
+            select(WorkflowTransitionRecord, WorkflowStateRecord)
+            .join(
+                WorkflowStateRecord,
+                WorkflowTransitionRecord.to_state_id == WorkflowStateRecord.id,
+            )
+            .where(
+                WorkflowTransitionRecord.workflow_id == item.workflow_id,
+                WorkflowTransitionRecord.from_state_id == item.workflow_state_id,
+            )
+        ).all()
+        return [{"code": t[1].code, "name": t[1].name} for t in transitions]
+    current = WorkItemStatus(item.status)
+    allowed = ALLOWED_TRANSITIONS.get(current, set())
+    return [{"code": s.value, "name": s.value.replace("_", " ").title()} for s in allowed]
