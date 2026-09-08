@@ -20,11 +20,13 @@ from app.presentation.admin import router as admin_router
 from app.presentation.agents import router as agents_router
 from app.presentation.configuration import router as configuration_router
 from app.presentation.http import router
+from app.presentation.integration_admin import router as integration_admin_router
 from app.presentation.integrations import router as integrations_router
 from app.presentation.operations import router as operations_router
 from app.presentation.people import router as people_router
 from app.presentation.projects import router as projects_router
 from app.presentation.workflows import router as workflows_router
+from app.infrastructure.request_context import request_id_context
 from app.settings import get_settings
 
 logger = logging.getLogger("linteam.http")
@@ -45,10 +47,18 @@ app.add_middleware(
     allow_origins=settings.allowed_origins,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
-    allow_headers=["Authorization", "Content-Type", "X-Request-ID", "X-Bootstrap-Token"],
+    allow_headers=[
+        "Authorization",
+        "Content-Type",
+        "X-Request-ID",
+        "X-Bootstrap-Token",
+        "X-API-Key",
+        "Idempotency-Key",
+    ],
 )
 app.include_router(router)
 app.include_router(admin_router)
+app.include_router(integration_admin_router)
 app.include_router(operations_router)
 app.include_router(workflows_router)
 app.include_router(integrations_router)
@@ -93,6 +103,14 @@ def app_index() -> FileResponse:
     return FileResponse(SPA_INDEX)
 
 
+@app.get("/app/manifest.webmanifest", include_in_schema=False)
+def pwa_manifest() -> FileResponse:
+    manifest = frontend_file("manifest.webmanifest")
+    if manifest is None:
+        raise RuntimeError("Frontend manifest is missing")
+    return FileResponse(manifest, media_type="application/manifest+json")
+
+
 @app.get("/app/{route:path}", include_in_schema=False)
 def frontend_route(route: str) -> FileResponse:
     return FileResponse(frontend_file(route) or SPA_INDEX)
@@ -101,37 +119,42 @@ def frontend_route(route: str) -> FileResponse:
 @app.middleware("http")
 async def request_id(request: Request, call_next: Any):  # type: ignore[no-untyped-def]
     correlation_id = request.headers.get("X-Request-ID", str(uuid4()))
+    token = request_id_context.set(correlation_id)
     client_ip = request.client.host if request.client else "unknown"
     if request.url.path.startswith("/api/") and not rate_limiter.allow(client_ip):
+        request_id_context.reset(token)
         return JSONResponse(
             status_code=429,
             content={"detail": "Rate limit exceeded"},
             headers={"Retry-After": "60", "X-Request-ID": correlation_id},
         )
     started = perf_counter()
-    response = await call_next(request)
-    response.headers["X-Request-ID"] = correlation_id
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
-    response.headers["Content-Security-Policy"] = (
-        "default-src 'self'; style-src 'self'; script-src 'self'; "
-        "img-src 'self' data:; connect-src 'self'"
-    )
-    logger.info(
-        json.dumps(
-            {
-                "event": "http_request",
-                "request_id": correlation_id,
-                "method": request.method,
-                "path": request.url.path,
-                "status": response.status_code,
-                "duration_ms": round((perf_counter() - started) * 1000, 2),
-            }
+    try:
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = correlation_id
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; style-src 'self'; script-src 'self'; "
+            "img-src 'self' data:; connect-src 'self'"
         )
-    )
-    return response
+        logger.info(
+            json.dumps(
+                {
+                    "event": "http_request",
+                    "request_id": correlation_id,
+                    "method": request.method,
+                    "path": request.url.path,
+                    "status": response.status_code,
+                    "duration_ms": round((perf_counter() - started) * 1000, 2),
+                }
+            )
+        )
+        return response
+    finally:
+        request_id_context.reset(token)
 
 
 @app.exception_handler(DomainError)

@@ -5,13 +5,13 @@ from datetime import UTC, datetime, timedelta
 from typing import Annotated
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.application.auth import ActorContext
-from app.application.use_cases import CreateWorkItem, ListWorkItems
+from app.application.use_cases import CreateWorkItem
 from app.domain.models import Priority, WorkItemStatus
 from app.infrastructure.database import (
     CustomFieldDefinitionRecord,
@@ -24,6 +24,7 @@ from app.infrastructure.database import (
     OrganizationRecord,
     OrganizationInviteRecord,
     RoleRecord,
+    ServiceAccountRecord,
     TagRecord,
     TeamRecord,
     UserRecord,
@@ -31,6 +32,7 @@ from app.infrastructure.database import (
     WorkItemTypeRecord,
     get_session,
 )
+from app.infrastructure.idempotency import hash_request, reserve, store_response
 from app.infrastructure.security import hash_password
 from app.infrastructure.sql_repositories import (
     SqlOrganizationRepository,
@@ -150,6 +152,23 @@ class CurrentUserView(BaseModel):
     id: UUID
     name: str
     email: EmailStr
+
+
+class PrincipalView(BaseModel):
+    id: UUID
+    name: str
+    principal_type: str
+    organization_id: UUID
+    effective_scopes: list[str]
+    service_account_id: UUID | None = None
+    api_key_id: UUID | None = None
+
+
+class WorkItemPageView(BaseModel):
+    items: list[WorkItemView]
+    page: int
+    page_size: int
+    total: int
 
 
 class AssigneeView(BaseModel):
@@ -340,6 +359,36 @@ def current_user(
     return CurrentUserView(id=user.id, name=user.name, email=user.email)
 
 
+@router.get("/me", response_model=PrincipalView)
+def current_principal(
+    actor: Annotated[ActorContext, Depends(current_actor)],
+    session: Annotated[Session, Depends(get_session)],
+) -> PrincipalView:
+    if actor.principal_type == "SERVICE_ACCOUNT":
+        account = session.get(ServiceAccountRecord, actor.service_account_id)
+        if account is None:
+            raise HTTPException(401, "Invalid or expired credentials")
+        return PrincipalView(
+            id=account.id,
+            name=account.name,
+            principal_type=actor.principal_type,
+            organization_id=account.organization_id,
+            effective_scopes=sorted(actor.permissions),
+            service_account_id=account.id,
+            api_key_id=actor.api_key_id,
+        )
+    user = session.get(UserRecord, actor.user_id)
+    if user is None:
+        raise HTTPException(401, "Invalid or expired credentials")
+    return PrincipalView(
+        id=user.id,
+        name=user.name,
+        principal_type=actor.principal_type,
+        organization_id=actor.organization_id,
+        effective_scopes=sorted(actor.permissions),
+    )
+
+
 @router.post("/auth/refresh", response_model=TokenResponse)
 def refresh(
     payload: RefreshRequest,
@@ -363,7 +412,7 @@ def list_departments(
     actor: Annotated[ActorContext, Depends(current_actor)],
     session: Annotated[Session, Depends(get_session)],
 ) -> object:
-    actor.require("department.manage")
+    actor.require_any("department.manage", "departments:read", "department.view")
     return session.scalars(
         select(DepartmentRecord)
         .where(
@@ -400,6 +449,17 @@ def create_department(
     )
     session.commit()
     return department
+
+
+@router.get("/organizations", response_model=list[OrganizationView])
+def list_organizations(
+    actor: Annotated[ActorContext, Depends(current_actor)],
+    session: Annotated[Session, Depends(get_session)],
+) -> list[OrganizationView]:
+    organization = session.get(OrganizationRecord, actor.organization_id)
+    if organization is None:
+        raise HTTPException(404, "Organization not found")
+    return [organization]
 
 
 @router.post("/members", status_code=201)
@@ -472,7 +532,21 @@ def create_work_item(
     payload: WorkItemInput,
     actor: Annotated[ActorContext, Depends(current_actor)],
     session: Annotated[Session, Depends(get_session)],
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> object:
+    request_hash = hash_request(payload.model_dump(mode="json"))
+    if idempotency_key:
+        result = reserve(
+            session,
+            organization_id=actor.organization_id,
+            namespace="work-item.create",
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+        )
+        if result.conflict:
+            raise HTTPException(409, "Idempotency key was already used for a different request")
+        if result.replay:
+            return result.body
     core_fields = payload.model_dump(
         include={"title", "description", "type_code", "priority", "due_at"}
     )
@@ -638,7 +712,19 @@ def create_work_item(
         },
     )
     session.commit()
-    return item
+    response = WorkItemView.model_validate(record).model_dump(mode="json")
+    if idempotency_key:
+        store_response(
+            session,
+            organization_id=actor.organization_id,
+            namespace="work-item.create",
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+            status_code=201,
+            body=response,
+        )
+        session.commit()
+    return response
 
 
 @router.get("/work-item-assignees", response_model=list[AssigneeView])
@@ -656,12 +742,84 @@ def work_item_assignees(
     return [AssigneeView(id=row.id, name=row.name, email=row.email) for row in rows]
 
 
-@router.get("/work-items", response_model=list[WorkItemView])
+@router.get("/work-items", response_model=WorkItemPageView)
 def list_work_items(
     actor: Annotated[ActorContext, Depends(current_actor)],
     session: Annotated[Session, Depends(get_session)],
-) -> object:
-    return ListWorkItems(SqlWorkItemRepository(session)).execute(actor)
+    status: str | None = None,
+    workflow: UUID | None = None,
+    department: UUID | None = None,
+    assignee: UUID | None = None,
+    priority: str | None = None,
+    type_code: Annotated[str | None, Query(alias="type")] = None,
+    project: UUID | None = None,
+    branch: str | None = None,
+    overdue: bool | None = None,
+    created_after: datetime | None = None,
+    updated_after: datetime | None = None,
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=200)] = 50,
+    sort_by: Annotated[
+        str,
+        Query(
+            pattern="^(created_at|updated_at|due_at|priority|status|title|human_readable_id)$"
+        ),
+    ] = "created_at",
+    sort_order: Annotated[str, Query(pattern="^(asc|desc)$")] = "desc",
+) -> WorkItemPageView:
+    actor.require_any("workitem.view", "workitems:read")
+    query = select(WorkItemRecord).where(WorkItemRecord.organization_id == actor.organization_id)
+    if status:
+        query = query.where(WorkItemRecord.status == status)
+    if workflow:
+        query = query.where(WorkItemRecord.workflow_id == workflow)
+    if department:
+        query = query.where(
+            or_(
+                WorkItemRecord.source_department_id == department,
+                WorkItemRecord.destination_department_id == department,
+            )
+        )
+    if assignee:
+        query = query.where(WorkItemRecord.assigned_to == assignee)
+    if priority:
+        query = query.where(WorkItemRecord.priority == priority)
+    if type_code:
+        query = query.where(WorkItemRecord.type_code == type_code.upper())
+    if project:
+        query = query.where(WorkItemRecord.project_id == project)
+    if branch:
+        query = query.where(WorkItemRecord.branch == branch)
+    if overdue is not None:
+        now = datetime.now(UTC)
+        if overdue:
+            query = query.where(
+                WorkItemRecord.due_at < now,
+                WorkItemRecord.status.notin_(["COMPLETED", "ARCHIVED", "CANCELLED"]),
+            )
+        else:
+            query = query.where(
+                or_(
+                    WorkItemRecord.due_at.is_(None),
+                    WorkItemRecord.due_at >= now,
+                    WorkItemRecord.status.in_(["COMPLETED", "ARCHIVED", "CANCELLED"]),
+                )
+            )
+    if created_after:
+        query = query.where(WorkItemRecord.created_at >= created_after)
+    if updated_after:
+        query = query.where(WorkItemRecord.updated_at >= updated_after)
+    sort_column = getattr(WorkItemRecord, sort_by)
+    total = session.scalar(select(func.count()).select_from(query.order_by(None).subquery())) or 0
+    query = query.order_by(
+        sort_column.asc() if sort_order.lower() == "asc" else sort_column.desc(),
+        WorkItemRecord.created_at.desc(),
+    )
+    safe_page = max(page, 1)
+    safe_size = min(max(page_size, 1), 200)
+    query = query.offset((safe_page - 1) * safe_size).limit(safe_size)
+    items = session.scalars(query).all()
+    return WorkItemPageView(items=items, page=safe_page, page_size=safe_size, total=total)
 
 
 @router.get("/work-items/{work_item_id}", response_model=WorkItemView)

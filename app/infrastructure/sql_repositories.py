@@ -8,9 +8,17 @@ from app.domain.errors import ConflictError
 from app.domain.models import Organization, Priority, WorkItem
 from app.infrastructure.database import (
     AuditEventRecord,
+    WebhookDeliveryRecord,
+    WebhookRecord,
     OrganizationRecord,
     OutboxEventRecord,
     WorkItemRecord,
+)
+from app.infrastructure.request_context import (
+    api_key_id_context,
+    principal_type_context,
+    request_id_context,
+    service_account_id_context,
 )
 
 
@@ -111,6 +119,21 @@ def record_audit(
     entity_id: UUID,
     new_state: dict[str, object],
 ) -> None:
+    state = dict(new_state)
+    request_id = request_id_context.get()
+    principal_type = principal_type_context.get()
+    service_account_id = service_account_id_context.get()
+    api_key_id = api_key_id_context.get()
+    if request_id and "request_id" not in state:
+        state["request_id"] = request_id
+    if principal_type and "actor_type" not in state:
+        state["actor_type"] = principal_type
+    if service_account_id and "service_account_id" not in state:
+        state["service_account_id"] = service_account_id
+    if api_key_id and "api_key_id" not in state:
+        state["api_key_id"] = api_key_id
+    if "source" not in state:
+        state["source"] = "API"
     session.add(
         AuditEventRecord(
             id=uuid4(),
@@ -119,7 +142,7 @@ def record_audit(
             action=action,
             entity_type=entity_type,
             entity_id=entity_id,
-            new_state=new_state,
+            new_state=state,
             created_at=datetime.now(UTC),
         )
     )
@@ -151,4 +174,29 @@ def record_event(
             next_attempt_at=occurred_at,
         )
     )
+    webhooks = session.scalars(
+        select(WebhookRecord).where(
+            WebhookRecord.organization_id == organization_id,
+            WebhookRecord.active.is_(True),
+        )
+    ).all()
+    for webhook in webhooks:
+        if webhook.events and event_type not in webhook.events:
+            continue
+        session.add(
+            WebhookDeliveryRecord(
+                id=uuid4(),
+                organization_id=organization_id,
+                webhook_id=webhook.id,
+                event_id=event_id,
+                event_type=event_type,
+                payload=payload,
+                status="PENDING",
+                attempts=0,
+                next_attempt_at=occurred_at,
+                delivered_at=None,
+                last_error="",
+                created_at=occurred_at,
+            )
+        )
     return event_id

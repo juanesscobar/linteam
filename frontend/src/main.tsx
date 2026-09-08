@@ -7,14 +7,13 @@ import { JoinPage } from "./app/JoinPage";
 import { InvitePage } from "./app/InvitePage";
 import { TaskCreatePage } from "./app/TaskCreatePage";
 import { TaskManagePage } from "./app/TaskManagePage";
+import { AdminIntegrationsPage } from "./app/AdminIntegrationsPage";
 import { TicketDetailDialog } from "./app/TicketDetailDialog";
 import "./styles.css";
 
 const client = new QueryClient({ defaultOptions: { queries: { retry: 1, staleTime: 20_000 } } });
 if ("serviceWorker" in navigator) {
-  navigator.serviceWorker.getRegistrations().then((registrations) =>
-    registrations.forEach((registration) => registration.unregister()),
-  );
+  navigator.serviceWorker.register("/app/sw.js");
 }
 function CreateRedirect() {
   useEffect(() => {
@@ -43,5 +42,5 @@ function TicketDialogBridge() {
 }
 
 const pathname = window.location.pathname;
-const page = pathname === "/join" ? <JoinPage /> : pathname === "/invite" ? <InvitePage /> : pathname === "/app/create" ? <TaskCreatePage /> : pathname === "/app/work" ? <TaskManagePage /> : <><CreateRedirect /><App /><TicketDialogBridge /></>;
+const page = pathname === "/join" ? <JoinPage /> : pathname === "/invite" ? <InvitePage /> : pathname === "/app/create" ? <TaskCreatePage /> : pathname === "/app/work" ? <TaskManagePage /> : pathname === "/app/admin/integrations" ? <AdminIntegrationsPage /> : <><CreateRedirect /><App /><TicketDialogBridge /></>;
 createRoot(document.getElementById("root")!).render(<React.StrictMode><QueryClientProvider client={client}><BrowserRouter>{page}</BrowserRouter></QueryClientProvider></React.StrictMode>);

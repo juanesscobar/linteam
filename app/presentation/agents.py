@@ -1,9 +1,10 @@
 import hashlib
-from datetime import UTC, datetime
+import secrets
+from datetime import UTC, datetime, timedelta
 from typing import Annotated, Literal
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
@@ -11,6 +12,7 @@ from sqlalchemy.orm import Session
 from app.application.auth import ActorContext
 from app.infrastructure.database import (
     AgentActionProposalRecord,
+    AgentApiTokenRecord,
     AgentApprovalRecord,
     AgentCapabilityRecord,
     AgentPermissionRecord,
@@ -57,7 +59,58 @@ class ProposalDecision(BaseModel):
     comment: str = Field(default="", max_length=1000)
 
 
+class AgentTokenInput(BaseModel):
+    name: str = Field(min_length=2, max_length=120)
+    scopes: list[Literal["runs.read", "runs.write"]] = Field(min_length=1, max_length=2)
+    expires_in_days: int | None = Field(default=90, ge=1, le=365)
+
+
+class AgentRunInput(BaseModel):
+    capability: str = Field(min_length=2, max_length=100)
+    input: dict[str, object] = Field(default_factory=dict)
+
+
+class AgentRunCompletion(BaseModel):
+    output: dict[str, object] = Field(default_factory=dict)
+    status: Literal["COMPLETED", "FAILED"] = "COMPLETED"
+
+
 router = APIRouter(prefix="/api/v1")
+
+
+def token_hash(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def authenticated_agent(
+    session: Session,
+    value: str | None,
+    required_scope: str,
+) -> tuple[AgentRecord, AgentApiTokenRecord]:
+    if not value or not value.startswith("lta_"):
+        raise HTTPException(401, "Missing or invalid agent token")
+    record = session.scalar(
+        select(AgentApiTokenRecord).where(AgentApiTokenRecord.token_hash == token_hash(value))
+    )
+    now = datetime.now(UTC)
+    if (
+        record is None
+        or record.revoked_at is not None
+        or (record.expires_at is not None and record.expires_at <= now)
+        or required_scope not in record.scopes
+    ):
+        raise HTTPException(401, "Agent token is not authorized")
+    agent = session.scalar(
+        select(AgentRecord).where(
+            AgentRecord.id == record.agent_id,
+            AgentRecord.organization_id == record.organization_id,
+            AgentRecord.active.is_(True),
+        )
+    )
+    if agent is None:
+        raise HTTPException(403, "Agent is inactive")
+    record.last_used_at = now
+    return agent, record
 
 
 @router.post("/agents", status_code=201)
@@ -101,6 +154,201 @@ def create_agent(
     )
     session.commit()
     return {"id": agent.id, "name": agent.name, "active": agent.active}
+
+
+@router.post("/agents/{agent_id}/tokens", status_code=201)
+def create_agent_token(
+    agent_id: UUID,
+    payload: AgentTokenInput,
+    actor: Annotated[ActorContext, Depends(current_actor)],
+    session: Annotated[Session, Depends(get_session)],
+) -> dict[str, object]:
+    actor.require("agent.manage")
+    agent = session.scalar(
+        select(AgentRecord).where(
+            AgentRecord.id == agent_id, AgentRecord.organization_id == actor.organization_id
+        )
+    )
+    if agent is None:
+        raise HTTPException(404, "Agent not found")
+    raw_token = f"lta_{secrets.token_urlsafe(32)}"
+    now = datetime.now(UTC)
+    record = AgentApiTokenRecord(
+        id=uuid4(),
+        organization_id=actor.organization_id,
+        agent_id=agent.id,
+        name=payload.name.strip(),
+        token_prefix=raw_token[:20],
+        token_hash=token_hash(raw_token),
+        scopes=sorted(set(payload.scopes)),
+        expires_at=now + timedelta(days=payload.expires_in_days)
+        if payload.expires_in_days
+        else None,
+        revoked_at=None,
+        last_used_at=None,
+        created_at=now,
+    )
+    session.add(record)
+    record_audit(
+        session,
+        organization_id=actor.organization_id,
+        actor_id=actor.user_id,
+        action="agent.token.create",
+        entity_type="agent_token",
+        entity_id=record.id,
+        new_state={"agent_id": str(agent.id), "scopes": record.scopes},
+    )
+    session.commit()
+    return {
+        "id": record.id,
+        "name": record.name,
+        "token": raw_token,
+        "expires_at": record.expires_at,
+        "scopes": record.scopes,
+    }
+
+
+@router.get("/agents/{agent_id}/tokens")
+def list_agent_tokens(
+    agent_id: UUID,
+    actor: Annotated[ActorContext, Depends(current_actor)],
+    session: Annotated[Session, Depends(get_session)],
+) -> list[dict[str, object]]:
+    actor.require("agent.manage")
+    return [
+        {
+            "id": row.id,
+            "name": row.name,
+            "prefix": row.token_prefix,
+            "scopes": row.scopes,
+            "expires_at": row.expires_at,
+            "revoked_at": row.revoked_at,
+            "last_used_at": row.last_used_at,
+        }
+        for row in session.scalars(
+            select(AgentApiTokenRecord)
+            .where(
+                AgentApiTokenRecord.agent_id == agent_id,
+                AgentApiTokenRecord.organization_id == actor.organization_id,
+            )
+            .order_by(AgentApiTokenRecord.created_at.desc())
+        ).all()
+    ]
+
+
+@router.delete("/agents/{agent_id}/tokens/{token_id}", status_code=204)
+def revoke_agent_token(
+    agent_id: UUID,
+    token_id: UUID,
+    actor: Annotated[ActorContext, Depends(current_actor)],
+    session: Annotated[Session, Depends(get_session)],
+) -> None:
+    actor.require("agent.manage")
+    record = session.scalar(
+        select(AgentApiTokenRecord).where(
+            AgentApiTokenRecord.id == token_id,
+            AgentApiTokenRecord.agent_id == agent_id,
+            AgentApiTokenRecord.organization_id == actor.organization_id,
+        )
+    )
+    if record is None:
+        raise HTTPException(404, "Agent token not found")
+    record.revoked_at = datetime.now(UTC)
+    record_audit(
+        session,
+        organization_id=actor.organization_id,
+        actor_id=actor.user_id,
+        action="agent.token.revoke",
+        entity_type="agent_token",
+        entity_id=record.id,
+        new_state={"revoked": True},
+    )
+    session.commit()
+
+
+@router.post("/agents/{agent_id}/runs", status_code=202)
+def queue_agent_run(
+    agent_id: UUID,
+    payload: AgentRunInput,
+    actor: Annotated[ActorContext, Depends(current_actor)],
+    session: Annotated[Session, Depends(get_session)],
+) -> dict[str, object]:
+    actor.require("agent.propose")
+    agent = session.scalar(
+        select(AgentRecord)
+        .join(AgentCapabilityRecord)
+        .where(
+            AgentRecord.id == agent_id,
+            AgentRecord.organization_id == actor.organization_id,
+            AgentRecord.active.is_(True),
+            AgentCapabilityRecord.code == payload.capability,
+        )
+    )
+    if agent is None:
+        raise HTTPException(404, "Active agent or capability not found")
+    now = datetime.now(UTC)
+    run = AgentRunRecord(
+        id=uuid4(),
+        organization_id=actor.organization_id,
+        agent_id=agent.id,
+        requested_by=actor.user_id,
+        capability=payload.capability,
+        input_summary=f"sha256:{hashlib.sha256(repr(sorted(payload.input.items())).encode()).hexdigest()}",
+        output={"input": payload.input},
+        status="PENDING",
+        started_at=now,
+        finished_at=None,
+    )
+    session.add(run)
+    session.commit()
+    return {"id": run.id, "status": run.status}
+
+
+@router.get("/agent-gateway/jobs/next")
+def next_agent_job(
+    x_agent_token: Annotated[str | None, Header()] = None,
+    session: Annotated[Session, Depends(get_session)] = None,
+) -> dict[str, object] | None:
+    agent, _token = authenticated_agent(session, x_agent_token, "runs.read")
+    run = session.scalar(
+        select(AgentRunRecord)
+        .where(
+            AgentRunRecord.agent_id == agent.id,
+            AgentRunRecord.organization_id == agent.organization_id,
+            AgentRunRecord.status == "PENDING",
+        )
+        .order_by(AgentRunRecord.started_at)
+    )
+    if run is None:
+        session.commit()
+        return None
+    run.status = "RUNNING"
+    session.commit()
+    return {"id": run.id, "capability": run.capability, "input": run.output.get("input", {})}
+
+
+@router.post("/agent-gateway/jobs/{run_id}/complete")
+def complete_agent_job(
+    run_id: UUID,
+    payload: AgentRunCompletion,
+    x_agent_token: Annotated[str | None, Header()] = None,
+    session: Annotated[Session, Depends(get_session)] = None,
+) -> dict[str, object]:
+    agent, _token = authenticated_agent(session, x_agent_token, "runs.write")
+    run = session.scalar(
+        select(AgentRunRecord).where(
+            AgentRunRecord.id == run_id,
+            AgentRunRecord.agent_id == agent.id,
+            AgentRunRecord.organization_id == agent.organization_id,
+        )
+    )
+    if run is None:
+        raise HTTPException(404, "Agent run not found")
+    if run.status != "RUNNING":
+        raise HTTPException(409, "Agent run is not running")
+    run.output, run.status, run.finished_at = payload.output, payload.status, datetime.now(UTC)
+    session.commit()
+    return {"id": run.id, "status": run.status}
 
 
 def route_agent(session: Session, organization_id: UUID, capability: str) -> AgentRecord:

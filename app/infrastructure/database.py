@@ -640,6 +640,23 @@ class AgentPermissionRecord(Base):
     permission_code: Mapped[str] = mapped_column(String(100))
 
 
+class AgentApiTokenRecord(Base):
+    __tablename__ = "agent_api_tokens"
+    __table_args__ = (UniqueConstraint("token_prefix"),)
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    organization_id: Mapped[UUID] = mapped_column(Uuid, index=True)
+    agent_id: Mapped[UUID] = mapped_column(ForeignKey("agents.id"), index=True)
+    name: Mapped[str] = mapped_column(String(120))
+    token_prefix: Mapped[str] = mapped_column(String(24))
+    token_hash: Mapped[str] = mapped_column(String(64))
+    scopes: Mapped[list[str]] = mapped_column(JSON, default=list)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class AgentRunRecord(Base):
     __tablename__ = "agent_runs"
 
@@ -684,6 +701,87 @@ class AgentApprovalRecord(Base):
     decision: Mapped[str] = mapped_column(String(20))
     comment: Mapped[str] = mapped_column(String(1000), default="")
     decided_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class ServiceAccountRecord(Base):
+    __tablename__ = "service_accounts"
+    __table_args__ = (UniqueConstraint("organization_id", "name"),)
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    organization_id: Mapped[UUID] = mapped_column(Uuid, index=True)
+    name: Mapped[str] = mapped_column(String(120))
+    description: Mapped[str] = mapped_column(String(500), default="")
+    status: Mapped[str] = mapped_column(String(30), default="ACTIVE", index=True)
+    created_by: Mapped[UUID] = mapped_column(Uuid)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class ApiKeyRecord(Base):
+    __tablename__ = "api_keys"
+    __table_args__ = (UniqueConstraint("prefix"),)
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    organization_id: Mapped[UUID] = mapped_column(Uuid, index=True)
+    service_account_id: Mapped[UUID] = mapped_column(ForeignKey("service_accounts.id"), index=True)
+    name: Mapped[str] = mapped_column(String(120))
+    prefix: Mapped[str] = mapped_column(String(24), index=True)
+    key_hash: Mapped[str] = mapped_column(String(64), index=True)
+    scopes: Mapped[list[str]] = mapped_column(JSON, default=list)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_by: Mapped[UUID] = mapped_column(Uuid)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class WebhookRecord(Base):
+    __tablename__ = "webhooks"
+    __table_args__ = (UniqueConstraint("organization_id", "name"),)
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    organization_id: Mapped[UUID] = mapped_column(Uuid, index=True)
+    name: Mapped[str] = mapped_column(String(120))
+    url: Mapped[str] = mapped_column(String(1000))
+    secret: Mapped[str] = mapped_column(String(255))
+    events: Mapped[list[str]] = mapped_column(JSON, default=list)
+    active: Mapped[bool] = mapped_column(default=True, index=True)
+    created_by: Mapped[UUID] = mapped_column(Uuid)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class WebhookDeliveryRecord(Base):
+    __tablename__ = "webhook_deliveries"
+    __table_args__ = (UniqueConstraint("webhook_id", "event_id"),)
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    organization_id: Mapped[UUID] = mapped_column(Uuid, index=True)
+    webhook_id: Mapped[UUID] = mapped_column(ForeignKey("webhooks.id"), index=True)
+    event_id: Mapped[UUID] = mapped_column(Uuid, index=True)
+    event_type: Mapped[str] = mapped_column(String(100), index=True)
+    payload: Mapped[dict[str, object]] = mapped_column(JSON)
+    status: Mapped[str] = mapped_column(String(30), index=True)
+    attempts: Mapped[int] = mapped_column(default=0)
+    next_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str] = mapped_column(String(500), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class IdempotencyRecord(Base):
+    __tablename__ = "idempotency_records"
+    __table_args__ = (UniqueConstraint("organization_id", "namespace", "idempotency_key"),)
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    organization_id: Mapped[UUID] = mapped_column(Uuid, index=True)
+    namespace: Mapped[str] = mapped_column(String(120), index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(160), index=True)
+    request_hash: Mapped[str] = mapped_column(String(64))
+    response_status: Mapped[int] = mapped_column()
+    response_body: Mapped[dict[str, object] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
 class ProcessRecommendationRecord(Base):
@@ -752,4 +850,9 @@ def create_schema() -> None:
 
 def get_session() -> Generator[Session, None, None]:
     with SessionLocal() as session:
-        yield session
+        try:
+            yield session
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise

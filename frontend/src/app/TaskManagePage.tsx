@@ -1,10 +1,13 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 
-import { api, session, type WorkItem } from "../lib/api";
+import { api, session, type WorkItem, type WorkItemsPage } from "../lib/api";
 
 export function TaskManagePage() {
   const queryClient = useQueryClient();
-  const tasks = useQuery({ queryKey: ["work-items"], queryFn: () => api<WorkItem[]>("/work-items") });
+  const tasks = useQuery({
+    queryKey: ["work-items"],
+    queryFn: () => api<WorkItemsPage>("/work-items").then((response) => response.items),
+  });
 
   if (!session.token) {
     window.location.assign("/login");

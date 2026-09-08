@@ -101,7 +101,7 @@ def list_teams(
     actor: Annotated[ActorContext, Depends(current_actor)],
     session: Annotated[Session, Depends(get_session)],
 ) -> object:
-    actor.require("department.manage")
+    actor.require_any("department.manage", "teams:read", "team.view")
     return session.scalars(
         select(TeamRecord).where(
             TeamRecord.organization_id == actor.organization_id,

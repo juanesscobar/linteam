@@ -18,9 +18,12 @@ class Settings(BaseSettings):
     trusted_hosts: list[str] = ["localhost", "127.0.0.1", "testserver"]
     rate_limit_per_minute: int = Field(default=120, ge=10, le=10_000)
     file_storage_path: str = "./data/files"
-    max_upload_bytes: int = Field(default=10_485_760, ge=1024, le=104_857_600)
+    # 7 MiB is deliberately small enough for fast mobile uploads and predictable local storage.
+    max_upload_bytes: int = Field(default=7_340_032, ge=1024, le=104_857_600)
     webhook_secret: str = "development-webhook-secret"
     webhook_tolerance_seconds: int = Field(default=300, ge=30, le=3600)
+    whatsapp_verify_token: str = "development-whatsapp-verify-token"
+    whatsapp_app_secret: str = "development-whatsapp-app-secret"
 
     @model_validator(mode="after")
     def reject_unsafe_production_settings(self) -> "Settings":

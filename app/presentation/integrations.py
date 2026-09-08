@@ -6,7 +6,8 @@ from datetime import UTC, datetime, timedelta
 from typing import Annotated, Literal
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -154,6 +155,150 @@ def verify_webhook(body: bytes, timestamp: str, signature: str, settings: Settin
     received = signature.removeprefix("sha256=")
     if not hmac.compare_digest(expected, received):
         raise HTTPException(401, "Invalid webhook signature")
+
+
+def verify_meta_signature(body: bytes, signature: str | None, settings: Settings) -> None:
+    if not signature:
+        raise HTTPException(401, "Missing WhatsApp webhook signature")
+    expected = (
+        "sha256="
+        + hmac.new(settings.whatsapp_app_secret.encode(), body, hashlib.sha256).hexdigest()
+    )
+    if not hmac.compare_digest(expected, signature):
+        raise HTTPException(401, "Invalid WhatsApp webhook signature")
+
+
+def create_inbound_work_item(
+    session: Session,
+    integration: IntegrationRecord,
+    channel: str,
+    body: bytes,
+    payload: dict[str, object],
+) -> dict[str, object]:
+    try:
+        message = normalize_message(channel, payload)
+    except InvalidProviderPayload as exc:
+        raise HTTPException(422, str(exc)) from exc
+    receipt = session.scalar(
+        select(WebhookReceiptRecord).where(
+            WebhookReceiptRecord.integration_id == integration.id,
+            WebhookReceiptRecord.external_event_id == message.event_id,
+        )
+    )
+    if receipt:
+        return {"receipt_id": receipt.id, "status": receipt.status, "duplicate": True}
+    now = datetime.now(UTC)
+    receipt = WebhookReceiptRecord(
+        id=uuid4(),
+        organization_id=integration.organization_id,
+        integration_id=integration.id,
+        external_event_id=message.event_id,
+        payload_hash=hashlib.sha256(body).hexdigest(),
+        status="RECEIVED",
+        received_at=now,
+        processed_at=None,
+    )
+    link = session.scalar(
+        select(IdentityLinkRecord).where(
+            IdentityLinkRecord.integration_id == integration.id,
+            IdentityLinkRecord.external_user_id == message.external_user_id,
+        )
+    )
+    work_item_id = None
+    inbound_status = "IDENTITY_REQUIRED"
+    if link and message.text.strip():
+        membership = session.scalar(
+            select(MembershipRecord).where(
+                MembershipRecord.organization_id == integration.organization_id,
+                MembershipRecord.user_id == link.user_id,
+            )
+        )
+        if membership:
+            item = CreateWorkItem(
+                SqlOrganizationRepository(session), SqlWorkItemRepository(session)
+            ).execute(
+                ActorContext(
+                    link.user_id,
+                    integration.organization_id,
+                    frozenset(membership.permissions)
+                    | frozenset(
+                        permission.code
+                        for role in membership.roles
+                        for permission in role.permissions
+                    ),
+                ),
+                title=message.text[:200],
+                description=message.text,
+                type_code="REQUEST",
+            )
+            work_item_id, inbound_status = item.id, "WORK_ITEM_CREATED"
+    session.add_all(
+        [
+            receipt,
+            InboundMessageRecord(
+                id=uuid4(),
+                organization_id=integration.organization_id,
+                integration_id=integration.id,
+                channel=channel,
+                external_event_id=message.event_id,
+                external_user_id=message.external_user_id,
+                text=message.text,
+                normalized={"channel": channel, "event_id": message.event_id},
+                status=inbound_status,
+                work_item_id=work_item_id,
+                received_at=now,
+            ),
+        ]
+    )
+    receipt.status, receipt.processed_at = inbound_status, now
+    session.commit()
+    return {
+        "receipt_id": receipt.id,
+        "status": inbound_status,
+        "work_item_id": work_item_id,
+        "duplicate": False,
+    }
+
+
+@router.get("/webhooks/whatsapp/{integration_id}", include_in_schema=False)
+def verify_whatsapp_webhook(
+    integration_id: UUID,
+    hub_mode: Annotated[str | None, Query(alias="hub.mode")] = None,
+    hub_verify_token: Annotated[str | None, Query(alias="hub.verify_token")] = None,
+    hub_challenge: Annotated[str | None, Query(alias="hub.challenge")] = None,
+    settings: Annotated[Settings, Depends(get_settings)] = None,
+) -> PlainTextResponse:
+    if hub_mode != "subscribe" or not hub_challenge or not hub_verify_token:
+        raise HTTPException(400, "Invalid WhatsApp verification request")
+    if not hmac.compare_digest(hub_verify_token, settings.whatsapp_verify_token):
+        raise HTTPException(403, "Invalid WhatsApp verification token")
+    return PlainTextResponse(hub_challenge)
+
+
+@router.post("/webhooks/whatsapp/{integration_id}", status_code=200)
+async def inbound_whatsapp_webhook(
+    integration_id: UUID,
+    request: Request,
+    x_hub_signature_256: Annotated[str | None, Header()] = None,
+    session: Annotated[Session, Depends(get_session)] = None,
+    settings: Annotated[Settings, Depends(get_settings)] = None,
+) -> dict[str, object]:
+    body = await request.body()
+    verify_meta_signature(body, x_hub_signature_256, settings)
+    integration = session.scalar(
+        select(IntegrationRecord).where(
+            IntegrationRecord.id == integration_id,
+            IntegrationRecord.provider == "whatsapp",
+            IntegrationRecord.active.is_(True),
+        )
+    )
+    if integration is None:
+        raise HTTPException(404, "WhatsApp integration not found")
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(422, "Invalid WhatsApp JSON payload") from exc
+    return create_inbound_work_item(session, integration, "whatsapp", body, payload)
 
 
 @router.post("/inbound/{channel}/{integration_id}", status_code=202)

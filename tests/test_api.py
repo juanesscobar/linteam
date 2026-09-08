@@ -3,14 +3,24 @@ import hmac
 import json
 import time
 from collections.abc import Generator
+from datetime import UTC, datetime, timedelta
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.infrastructure.database import Base, get_session
+from app.infrastructure.database import (
+    AuditEventRecord,
+    ApiKeyRecord,
+    Base,
+    OrganizationRecord,
+    ServiceAccountRecord,
+    WorkItemRecord,
+    get_session,
+)
 from app.main import app
 from app.settings import Settings, get_settings
 
@@ -22,10 +32,17 @@ def client(tmp_path) -> Generator[TestClient, None, None]:
     )
     Base.metadata.create_all(engine)
     sessions = sessionmaker(bind=engine, expire_on_commit=False)
+    app.state.test_sessionmaker = sessions
+    app.state.test_engine = engine
 
     def override() -> Generator[Session, None, None]:
         with sessions() as session:
-            yield session
+            try:
+                yield session
+                session.commit()
+            except Exception:
+                session.rollback()
+                raise
 
     app.dependency_overrides[get_session] = override
     app.dependency_overrides[get_settings] = lambda: Settings(
@@ -572,7 +589,7 @@ def test_authenticated_end_to_end_flow(client: TestClient) -> None:
         "CommentCreated",
         "ChecklistCreated",
     }
-    assert len(client.get("/api/v1/work-items", headers=headers).json()) == 2
+    assert len(client.get("/api/v1/work-items", headers=headers).json()["items"]) == 2
     audit = client.get("/api/v1/audit", headers=headers)
     assert audit.status_code == 200
     assert {event["action"] for event in audit.json()} >= {
@@ -583,6 +600,204 @@ def test_authenticated_end_to_end_flow(client: TestClient) -> None:
         "member.create",
         "workitem.create",
     }
+
+
+def test_api_keys_support_service_account_me_listing_pagination_and_scope_persistence(
+    client: TestClient,
+) -> None:
+    setup = client.post(
+        "/api/v1/setup",
+        headers={"X-Bootstrap-Token": "development-bootstrap-token"},
+        json={
+            "organization_name": "Lin Group",
+            "organization_code": "LINTEAM",
+            "admin_name": "Admin",
+            "admin_email": "admin@linteam.example.com",
+            "password": "very-secure-password",
+        },
+    )
+    assert setup.status_code == 201
+    admin_login = client.post(
+        "/api/v1/auth/login",
+        json={"email": "admin@linteam.example.com", "password": "very-secure-password"},
+    )
+    admin_headers = {"Authorization": f"Bearer {admin_login.json()['access_token']}"}
+    service_account = client.post(
+        "/api/v1/service-accounts",
+        headers=admin_headers,
+        json={"name": "Pilot Bot", "description": "Pruebas de integración"},
+    )
+    assert service_account.status_code == 201
+    api_key = client.post(
+        f"/api/v1/service-accounts/{service_account.json()['id']}/api-keys",
+        headers=admin_headers,
+        json={
+            "name": "Read key",
+            "scopes": ["organization:read", "workitems:read"],
+            "expires_at": (datetime.now(UTC) + timedelta(days=1)).isoformat(),
+        },
+    )
+    assert api_key.status_code == 201
+    key_headers = {"X-API-Key": api_key.json()["full_key"]}
+    me = client.get("/api/v1/me", headers={**key_headers, "X-Request-ID": "pilot-req-001"})
+    assert me.status_code == 200
+    assert me.headers["X-Request-ID"] == "pilot-req-001"
+    assert me.json()["principal_type"] == "SERVICE_ACCOUNT"
+    assert me.json()["service_account_id"] == service_account.json()["id"]
+    assert "workitems:read" in me.json()["effective_scopes"]
+    with client.app.state.test_sessionmaker() as session:
+        persisted_key = session.get(ApiKeyRecord, UUID(api_key.json()["id"]))
+        assert persisted_key is not None
+        assert persisted_key.key_hash != api_key.json()["full_key"]
+        assert persisted_key.last_used_at is not None
+        audit_row = session.scalar(
+            select(AuditEventRecord).where(AuditEventRecord.action == "api_key.use")
+        )
+        assert audit_row is not None
+        assert audit_row.organization_id == UUID(setup.json()["id"])
+        assert audit_row.new_state["source"] == "API"
+        assert audit_row.new_state["actor_type"] == "SERVICE_ACCOUNT"
+        assert audit_row.new_state["service_account_id"] == service_account.json()["id"]
+        assert audit_row.new_state["api_key_id"] == api_key.json()["id"]
+        assert audit_row.new_state["request_id"] == "pilot-req-001"
+    created = client.post(
+        "/api/v1/work-items",
+        headers=admin_headers,
+        json={
+            "title": "Solicitud piloto",
+            "type_code": "REQUEST",
+            "priority": "NORMAL",
+            "description": "Elemento visible en la organización principal",
+        },
+    )
+    assert created.status_code == 201
+    with client.app.state.test_sessionmaker() as session:
+        session.add(
+            OrganizationRecord(
+                id=uuid4(),
+                name="Otra organización",
+                code="OTHER",
+                created_at=datetime.now(UTC),
+            )
+        )
+        session.flush()
+        session.add(
+            WorkItemRecord(
+                id=uuid4(),
+                organization_id=session.scalar(
+                    select(OrganizationRecord.id).where(OrganizationRecord.code == "OTHER")
+                ),
+                human_readable_id="WI-999999",
+                title="Trabajo externo",
+                description="No debe filtrarse",
+                type_code="REQUEST",
+                type_id=None,
+                status="NEW",
+                priority="NORMAL",
+                impact="INDIVIDUAL",
+                urgency="NORMAL",
+                category="",
+                source_department_id=None,
+                destination_department_id=None,
+                branch="",
+                expected_deliverable="",
+                custom_data={},
+                metadata_json={},
+                created_by=uuid4(),
+                assigned_to=None,
+                due_at=None,
+                created_at=datetime.now(UTC),
+                updated_at=datetime.now(UTC),
+                workflow_id=None,
+                workflow_state_id=None,
+                sla_id=None,
+                response_due_at=None,
+                resolution_due_at=None,
+                responded_at=None,
+                sla_escalated_at=None,
+                project_id=None,
+            )
+        )
+        session.commit()
+    items = client.get("/api/v1/work-items", headers=key_headers)
+    assert items.status_code == 200
+    assert items.json()["page"] == 1
+    assert items.json()["page_size"] == 50
+    assert items.json()["total"] == 1
+    assert len(items.json()["items"]) == 1
+    assert items.json()["items"][0]["organization_id"] == setup.json()["id"]
+    paged = client.get(
+        "/api/v1/work-items",
+        headers=admin_headers,
+        params={"page": 1, "page_size": 1, "sort_by": "created_at", "sort_order": "desc"},
+    )
+    assert paged.status_code == 200
+    assert paged.json()["total"] == 1
+    assert len(paged.json()["items"]) == 1
+    assert client.get(
+        "/api/v1/work-items",
+        headers=admin_headers,
+        params={"sort_by": "does_not_exist"},
+    ).status_code == 422
+
+    expired_key = client.post(
+        f"/api/v1/service-accounts/{service_account.json()['id']}/api-keys",
+        headers=admin_headers,
+        json={
+            "name": "Expired key",
+            "scopes": ["organization:read"],
+            "expires_at": (datetime.now(UTC) - timedelta(days=1)).isoformat(),
+        },
+    )
+    assert expired_key.status_code == 201
+    assert client.get("/api/v1/me", headers={"X-API-Key": expired_key.json()["full_key"]}).status_code == 401
+    assert (
+        client.post(
+            f"/api/v1/api-keys/{api_key.json()['id']}/revoke", headers=admin_headers
+        ).status_code
+        == 204
+    )
+    assert client.get("/api/v1/me", headers=key_headers).status_code == 401
+    assert client.get("/api/v1/me", headers={"X-API-Key": "bad-key"}).status_code == 401
+
+
+def test_work_item_creation_with_idempotency_key_replays_and_conflicts(client: TestClient) -> None:
+    setup = client.post(
+        "/api/v1/setup",
+        headers={"X-Bootstrap-Token": "development-bootstrap-token"},
+        json={
+            "organization_name": "Lin Group",
+            "organization_code": "LINTEAM",
+            "admin_name": "Admin",
+            "admin_email": "admin@linteam.example.com",
+            "password": "very-secure-password",
+        },
+    )
+    assert setup.status_code == 201
+    login = client.post(
+        "/api/v1/auth/login",
+        json={"email": "admin@linteam.example.com", "password": "very-secure-password"},
+    )
+    headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+    first = client.post(
+        "/api/v1/work-items",
+        headers={**headers, "Idempotency-Key": "pilot-create-001"},
+        json={"title": "Idempotente", "type_code": "REQUEST", "priority": "NORMAL"},
+    )
+    assert first.status_code == 201
+    replay = client.post(
+        "/api/v1/work-items",
+        headers={**headers, "Idempotency-Key": "pilot-create-001"},
+        json={"title": "Idempotente", "type_code": "REQUEST", "priority": "NORMAL"},
+    )
+    assert replay.status_code == 201
+    assert replay.json()["id"] == first.json()["id"]
+    conflict = client.post(
+        "/api/v1/work-items",
+        headers={**headers, "Idempotency-Key": "pilot-create-001"},
+        json={"title": "Cambió", "type_code": "REQUEST", "priority": "NORMAL"},
+    )
+    assert conflict.status_code == 409
 
 
 def test_protected_endpoint_rejects_anonymous_user(client: TestClient) -> None:

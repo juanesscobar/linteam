@@ -3,7 +3,7 @@ from decimal import Decimal
 from typing import Annotated, Literal
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Response
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -25,6 +25,7 @@ from app.infrastructure.database import (
     WorkItemRecord,
     get_session,
 )
+from app.infrastructure.idempotency import hash_request, reserve, store_response
 from app.infrastructure.sql_repositories import record_audit
 from app.presentation.auth import current_actor
 from app.presentation.operations import add_activity, get_work_item
@@ -144,6 +145,58 @@ class AutomationExecuteInput(BaseModel):
 router = APIRouter(prefix="/api/v1")
 
 
+def _execute_workflow_transition(
+    work_item_id: UUID,
+    payload: WorkflowMoveInput,
+    actor: ActorContext,
+    session: Session,
+) -> None:
+    item = get_work_item(session, actor, work_item_id)
+    if item.workflow_id is None or item.workflow_state_id is None:
+        raise HTTPException(409, "Work item has no workflow")
+    target = session.scalar(
+        select(WorkflowStateRecord).where(
+            WorkflowStateRecord.workflow_id == item.workflow_id,
+            WorkflowStateRecord.code == payload.to_code,
+        )
+    )
+    if target is None:
+        raise HTTPException(404, "Workflow state not found")
+    transition = session.scalar(
+        select(WorkflowTransitionRecord).where(
+            WorkflowTransitionRecord.workflow_id == item.workflow_id,
+            WorkflowTransitionRecord.from_state_id == item.workflow_state_id,
+            WorkflowTransitionRecord.to_state_id == target.id,
+        )
+    )
+    if transition is None:
+        raise HTTPException(409, "Workflow transition is not allowed")
+    actor.require(transition.required_permission)
+    if transition.requires_approval:
+        approved = session.scalar(
+            select(ApprovalRequestRecord.id).where(
+                ApprovalRequestRecord.work_item_id == item.id,
+                ApprovalRequestRecord.organization_id == actor.organization_id,
+                ApprovalRequestRecord.status == "APPROVED",
+            )
+        )
+        if approved is None:
+            raise HTTPException(409, "An approved request is required for this transition")
+    previous = item.status
+    item.workflow_state_id, item.status, item.updated_at = target.id, target.code, datetime.now(UTC)
+    add_activity(session, actor, item, "WorkflowTransitioned", f"Estado {previous} â†’ {target.code}")
+    record_audit(
+        session,
+        organization_id=actor.organization_id,
+        actor_id=actor.user_id,
+        action="workflow.transition",
+        entity_type="work_item",
+        entity_id=item.id,
+        new_state={"status": target.code},
+    )
+    session.commit()
+
+
 @router.post("/workflows", response_model=WorkflowView, status_code=201)
 def create_workflow(
     payload: WorkflowInput,
@@ -261,7 +314,21 @@ def execute_workflow_transition(
     payload: WorkflowMoveInput,
     actor: Annotated[ActorContext, Depends(current_actor)],
     session: Annotated[Session, Depends(get_session)],
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> None:
+    request_hash = hash_request({"work_item_id": str(work_item_id), **payload.model_dump(mode="json")})
+    if idempotency_key:
+        result = reserve(
+            session,
+            organization_id=actor.organization_id,
+            namespace="workflow.transition",
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+        )
+        if result.conflict:
+            raise HTTPException(409, "Idempotency key was already used for a different request")
+        if result.replay:
+            return Response(status_code=204)
     item = get_work_item(session, actor, work_item_id)
     if item.workflow_id is None or item.workflow_state_id is None:
         raise HTTPException(409, "Work item has no workflow")
@@ -306,6 +373,28 @@ def execute_workflow_transition(
         new_state={"status": target.code},
     )
     session.commit()
+    if idempotency_key:
+        store_response(
+            session,
+            organization_id=actor.organization_id,
+            namespace="workflow.transition",
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+            status_code=204,
+            body=None,
+        )
+        session.commit()
+
+
+@router.post("/work-items/{work_item_id}/transition", status_code=204)
+def transition_work_item(
+    work_item_id: UUID,
+    payload: WorkflowMoveInput,
+    actor: Annotated[ActorContext, Depends(current_actor)],
+    session: Annotated[Session, Depends(get_session)],
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+) -> None:
+    return execute_workflow_transition(work_item_id, payload, actor, session, idempotency_key)
 
 
 @router.post("/work-items/{work_item_id}/approvals", response_model=ApprovalView, status_code=201)

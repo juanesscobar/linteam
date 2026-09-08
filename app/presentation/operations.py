@@ -2,7 +2,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Annotated
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, or_, select
@@ -30,6 +30,7 @@ from app.infrastructure.database import (
 )
 from app.infrastructure.events import LoggingEventPublisher
 from app.infrastructure.files import LocalFileStorage
+from app.infrastructure.idempotency import hash_request, reserve, store_response
 from app.infrastructure.sql_repositories import record_audit, record_event
 from app.presentation.auth import current_actor
 from app.settings import Settings, get_settings
@@ -320,8 +321,13 @@ def set_assignees(
     session.add_all(
         [
             AssignmentRecord(
-                id=uuid4(), organization_id=actor.organization_id, work_item_id=item.id,
-                assignee_id=assignee_id, assigned_by=actor.user_id, accepted_at=None, created_at=now,
+                id=uuid4(),
+                organization_id=actor.organization_id,
+                work_item_id=item.id,
+                assignee_id=assignee_id,
+                assigned_by=actor.user_id,
+                accepted_at=None,
+                created_at=now,
             )
             for assignee_id in assignee_ids
         ]
@@ -329,15 +335,37 @@ def set_assignees(
     session.add_all(
         [
             NotificationRecord(
-                id=uuid4(), organization_id=actor.organization_id, recipient_id=assignee_id,
-                kind="ASSIGNMENT", title=f"Asignación {item.human_readable_id}", body=item.title,
-                entity_type="work_item", entity_id=item.id, read_at=None, created_at=now,
+                id=uuid4(),
+                organization_id=actor.organization_id,
+                recipient_id=assignee_id,
+                kind="ASSIGNMENT",
+                title=f"Asignación {item.human_readable_id}",
+                body=item.title,
+                entity_type="work_item",
+                entity_id=item.id,
+                read_at=None,
+                created_at=now,
             )
             for assignee_id in assignee_ids
         ]
     )
-    add_activity(session, actor, item, "WorkItemAssigneesUpdated", "Responsables actualizados", {"assignee_ids": [str(value) for value in assignee_ids]})
-    record_audit(session, organization_id=actor.organization_id, actor_id=actor.user_id, action="workitem.assign", entity_type="work_item", entity_id=item.id, new_state={"assignee_ids": [str(value) for value in assignee_ids]})
+    add_activity(
+        session,
+        actor,
+        item,
+        "WorkItemAssigneesUpdated",
+        "Responsables actualizados",
+        {"assignee_ids": [str(value) for value in assignee_ids]},
+    )
+    record_audit(
+        session,
+        organization_id=actor.organization_id,
+        actor_id=actor.user_id,
+        action="workitem.assign",
+        entity_type="work_item",
+        entity_id=item.id,
+        new_state={"assignee_ids": [str(value) for value in assignee_ids]},
+    )
     session.commit()
 
 
@@ -403,9 +431,23 @@ def comment(
     payload: CommentInput,
     actor: Annotated[ActorContext, Depends(current_actor)],
     session: Annotated[Session, Depends(get_session)],
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> object:
     actor.require("workitem.update")
     item = get_work_item(session, actor, work_item_id)
+    request_hash = hash_request({"work_item_id": str(work_item_id), **payload.model_dump(mode="json")})
+    if idempotency_key:
+        result = reserve(
+            session,
+            organization_id=actor.organization_id,
+            namespace="work-item.comment",
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+        )
+        if result.conflict:
+            raise HTTPException(409, "Idempotency key was already used for a different request")
+        if result.replay:
+            return result.body
     if payload.mention_user_ids:
         valid_mentions = set(
             session.scalars(
@@ -441,10 +483,22 @@ def comment(
                 read_at=None,
                 created_at=datetime.now(UTC),
             )
-        )
+    )
     add_activity(session, actor, item, "CommentCreated", "Comentario agregado")
     session.commit()
-    return value
+    response = CommentView.model_validate(value).model_dump(mode="json")
+    if idempotency_key:
+        store_response(
+            session,
+            organization_id=actor.organization_id,
+            namespace="work-item.comment",
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+            status_code=201,
+            body=response,
+        )
+        session.commit()
+    return response
 
 
 @router.get("/work-items/{work_item_id}/timeline", response_model=list[ActivityView])
@@ -629,6 +683,24 @@ def download_attachment(
     return FileResponse(path, media_type=attachment.content_type, filename=attachment.original_name)
 
 
+@router.get("/work-items/{work_item_id}/attachments", response_model=list[AttachmentView])
+def list_attachments(
+    work_item_id: UUID,
+    actor: Annotated[ActorContext, Depends(current_actor)],
+    session: Annotated[Session, Depends(get_session)],
+) -> object:
+    actor.require("workitem.view")
+    get_work_item(session, actor, work_item_id)
+    return session.scalars(
+        select(AttachmentRecord)
+        .where(
+            AttachmentRecord.organization_id == actor.organization_id,
+            AttachmentRecord.work_item_id == work_item_id,
+        )
+        .order_by(AttachmentRecord.created_at.desc())
+    ).all()
+
+
 @router.get("/my-work")
 def my_work(
     actor: Annotated[ActorContext, Depends(current_actor)],
@@ -673,7 +745,7 @@ def executive_summary(
     actor: Annotated[ActorContext, Depends(current_actor)],
     session: Annotated[Session, Depends(get_session)],
 ) -> ExecutiveSummary:
-    actor.require("executive.view")
+    actor.require_any("executive.view", "analytics:read")
     base = WorkItemRecord.organization_id == actor.organization_id
     rows = session.execute(
         select(WorkItemRecord.status, func.count()).where(base).group_by(WorkItemRecord.status)

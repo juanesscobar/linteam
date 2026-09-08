@@ -163,7 +163,7 @@ def list_members(
     actor: Annotated[ActorContext, Depends(current_actor)],
     session: Annotated[Session, Depends(get_session)],
 ) -> list[ProfileView]:
-    actor.require("member.manage")
+    actor.require_any("member.manage", "members:read", "member.view")
     members = session.scalars(
         select(MembershipRecord).where(MembershipRecord.organization_id == actor.organization_id)
     ).all()
@@ -177,7 +177,7 @@ def get_profile(
     session: Annotated[Session, Depends(get_session)],
 ) -> ProfileView:
     member = _membership(session, actor, member_id)
-    if member.user_id != actor.user_id:
+    if member.user_id != actor.user_id and not actor.has("member.manage") and not actor.has("member.view"):
         actor.require("member.manage")
     return _profile(session, actor, member)
 
