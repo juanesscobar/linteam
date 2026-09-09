@@ -37,10 +37,16 @@ services:
       db:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready')"]
-      interval: 10s
-      timeout: 3s
-      retries: 12
+  test:
+    [
+      "CMD",
+      "python",
+      "-c",
+      "import urllib.request; r=urllib.request.Request('http://127.0.0.1:8000/ready', headers={'Host':'linteam.linteam.online'}); urllib.request.urlopen(r)"
+    ]
+  interval: 10s
+  timeout: 3s
+  retries: 12
     restart: unless-stopped
 
 volumes:
