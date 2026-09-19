@@ -24,6 +24,11 @@ class Settings(BaseSettings):
     webhook_tolerance_seconds: int = Field(default=300, ge=30, le=3600)
     whatsapp_verify_token: str = "development-whatsapp-verify-token"
     whatsapp_app_secret: str = "development-whatsapp-app-secret"
+    telegram_enabled: bool = False
+    telegram_bot_token: str = ""
+    telegram_bot_username: str = ""
+    telegram_webhook_secret: str = ""
+    telegram_webhook_url: str = ""
 
     @model_validator(mode="after")
     def reject_unsafe_production_settings(self) -> "Settings":

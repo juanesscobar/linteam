@@ -608,6 +608,83 @@ class NotificationPreferenceRecord(Base):
     quiet_hours: Mapped[dict[str, object]] = mapped_column(JSON, default=dict)
 
 
+class CommunicationIdentityRecord(Base):
+    """A verified human identity on a communication channel, never a username match."""
+
+    __tablename__ = "communication_identities"
+    __table_args__ = (UniqueConstraint("channel", "external_user_id"),)
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    organization_id: Mapped[UUID] = mapped_column(Uuid, index=True)
+    user_id: Mapped[UUID] = mapped_column(Uuid, index=True)
+    channel: Mapped[str] = mapped_column(String(30), index=True)
+    external_user_id: Mapped[str] = mapped_column(String(200))
+    external_chat_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    display_name: Mapped[str] = mapped_column(String(200), default="")
+    verified_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    enabled: Mapped[bool] = mapped_column(default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class CommunicationLinkTokenRecord(Base):
+    __tablename__ = "communication_link_tokens"
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    organization_id: Mapped[UUID] = mapped_column(Uuid, index=True)
+    user_id: Mapped[UUID] = mapped_column(Uuid, index=True)
+    channel: Mapped[str] = mapped_column(String(30), index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class ProcessedChannelEventRecord(Base):
+    __tablename__ = "processed_channel_events"
+    __table_args__ = (UniqueConstraint("channel", "external_event_id"),)
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    channel: Mapped[str] = mapped_column(String(30), index=True)
+    external_event_id: Mapped[str] = mapped_column(String(200))
+    organization_id: Mapped[UUID | None] = mapped_column(Uuid, nullable=True, index=True)
+    status: Mapped[str] = mapped_column(String(30))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class AgentConfirmationRecord(Base):
+    __tablename__ = "agent_confirmations"
+    __table_args__ = (UniqueConstraint("channel", "external_confirmation_id"),)
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    organization_id: Mapped[UUID] = mapped_column(Uuid, index=True)
+    user_id: Mapped[UUID] = mapped_column(Uuid, index=True)
+    channel: Mapped[str] = mapped_column(String(30), index=True)
+    external_confirmation_id: Mapped[str] = mapped_column(String(120))
+    intent: Mapped[str] = mapped_column(String(80))
+    payload: Mapped[dict[str, object]] = mapped_column(JSON)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class AgentSessionRecord(Base):
+    __tablename__ = "agent_sessions"
+    __table_args__ = (UniqueConstraint("channel", "external_user_id"),)
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    organization_id: Mapped[UUID] = mapped_column(Uuid, index=True)
+    user_id: Mapped[UUID] = mapped_column(Uuid, index=True)
+    channel: Mapped[str] = mapped_column(String(30), index=True)
+    external_user_id: Mapped[str] = mapped_column(String(200))
+    pending_intent: Mapped[str] = mapped_column(String(80))
+    step: Mapped[str] = mapped_column(String(80))
+    payload: Mapped[dict[str, object]] = mapped_column(JSON, default=dict)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class AgentRecord(Base):
     __tablename__ = "agents"
     __table_args__ = (UniqueConstraint("organization_id", "name"),)

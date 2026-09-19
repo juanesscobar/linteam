@@ -53,7 +53,9 @@ def client(tmp_path) -> Generator[TestClient, None, None]:
     app.dependency_overrides.clear()
 
 
-def test_invited_member_can_join_and_then_log_in_without_organization_id(client: TestClient) -> None:
+def test_invited_member_can_join_and_then_log_in_without_organization_id(
+    client: TestClient,
+) -> None:
     setup = client.post(
         "/api/v1/setup",
         headers={"X-Bootstrap-Token": "development-bootstrap-token"},
@@ -734,11 +736,14 @@ def test_api_keys_support_service_account_me_listing_pagination_and_scope_persis
     assert paged.status_code == 200
     assert paged.json()["total"] == 1
     assert len(paged.json()["items"]) == 1
-    assert client.get(
-        "/api/v1/work-items",
-        headers=admin_headers,
-        params={"sort_by": "does_not_exist"},
-    ).status_code == 422
+    assert (
+        client.get(
+            "/api/v1/work-items",
+            headers=admin_headers,
+            params={"sort_by": "does_not_exist"},
+        ).status_code
+        == 422
+    )
 
     expired_key = client.post(
         f"/api/v1/service-accounts/{service_account.json()['id']}/api-keys",
@@ -750,7 +755,10 @@ def test_api_keys_support_service_account_me_listing_pagination_and_scope_persis
         },
     )
     assert expired_key.status_code == 201
-    assert client.get("/api/v1/me", headers={"X-API-Key": expired_key.json()["full_key"]}).status_code == 401
+    assert (
+        client.get("/api/v1/me", headers={"X-API-Key": expired_key.json()["full_key"]}).status_code
+        == 401
+    )
     assert (
         client.post(
             f"/api/v1/api-keys/{api_key.json()['id']}/revoke", headers=admin_headers
@@ -802,6 +810,43 @@ def test_work_item_creation_with_idempotency_key_replays_and_conflicts(client: T
 
 def test_protected_endpoint_rejects_anonymous_user(client: TestClient) -> None:
     assert client.get("/api/v1/work-items").status_code == 401
+
+
+def test_web_agent_uses_authenticated_actor_and_requires_done_confirmation(
+    client: TestClient,
+) -> None:
+    setup = client.post(
+        "/api/v1/setup",
+        headers={"X-Bootstrap-Token": "development-bootstrap-token"},
+        json={
+            "organization_name": "Agent Org",
+            "organization_code": "AGENT",
+            "admin_name": "Admin",
+            "admin_email": "agent@example.com",
+            "password": "very-secure-password",
+        },
+    )
+    assert setup.status_code == 201
+    login = client.post(
+        "/api/v1/auth/login",
+        json={"email": "agent@example.com", "password": "very-secure-password"},
+    )
+    headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+    item = client.post(
+        "/api/v1/work-items",
+        headers=headers,
+        json={"title": "Revisar informe", "type_code": "TASK", "priority": "NORMAL"},
+    )
+    assert item.status_code == 201
+    tasks = client.post("/api/v1/agent/execute", headers=headers, json={"text": "/tasks"})
+    assert tasks.status_code == 200
+    assert "Revisar informe" in tasks.json()["text"]
+    pending = client.post(
+        "/api/v1/agent/execute",
+        headers=headers,
+        json={"text": f"/done {item.json()['id']}"},
+    )
+    assert pending.json()["status"] == "CONFIRMATION_REQUIRED"
 
 
 def test_pwa_assets_are_served(client: TestClient) -> None:

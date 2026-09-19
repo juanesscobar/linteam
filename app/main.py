@@ -21,6 +21,7 @@ from app.presentation.agents import router as agents_router
 from app.presentation.configuration import router as configuration_router
 from app.presentation.http import router
 from app.presentation.integration_admin import router as integration_admin_router
+from app.presentation.linteam_agent import router as linteam_agent_router
 from app.presentation.integrations import router as integrations_router
 from app.presentation.operations import router as operations_router
 from app.presentation.people import router as people_router
@@ -59,6 +60,7 @@ app.add_middleware(
 app.include_router(router)
 app.include_router(admin_router)
 app.include_router(integration_admin_router)
+app.include_router(linteam_agent_router)
 app.include_router(operations_router)
 app.include_router(workflows_router)
 app.include_router(integrations_router)
