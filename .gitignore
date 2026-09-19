@@ -8,3 +8,8 @@ dist/
 node_modules/
 *.egg-info/
 *.tsbuildinfo
+
+# Notas locales / logs de operacion (no commitear)
+logsvps*.md
+correctivo1.md
+text-lin-team.md
